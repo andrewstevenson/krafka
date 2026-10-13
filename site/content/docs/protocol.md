@@ -78,6 +78,10 @@ Every API has a minimum and a maximum supported version.
 The client only encodes/decodes versions within `[MIN, MAX]`; versions outside
 this range are rejected with a protocol error.
 
+OffsetFetch and OffsetCommit v10 require nonzero topic IDs for explicit topics;
+invalid IDs fail encoding before bytes are written. Null OffsetFetch topics
+request all offsets. Admin group-offset calls use name-based versions through v9.
+
 | API | Min | Max | Key Features |
 |-----|-----|-----|--------------|
 | Produce | 3 | 13 | v3 transactions, v9 flexible encoding, v11 ZStd compression, v13 topic UUIDs (KIP-516) |

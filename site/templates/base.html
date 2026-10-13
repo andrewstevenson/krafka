@@ -1,32 +1,27 @@
-{#-
-  Base template: the document shell and the entire SEO surface.
-
-  Every page's <head> is assembled here rather than per-template, because a
-  meta tag that exists on some pages and not others is worse than one that
-  exists nowhere — it makes the gap invisible in review.
--#}
+{#- Shared document metadata and assets. -#}
 <!DOCTYPE html>
 <html lang="{{ lang | default(value=config.default_language) }}" data-theme="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
-{#- Title, description and canonical URL.
-
-    Resolved once here rather than per-template: a meta tag that exists on some
-    pages and not others is worse than one that exists nowhere, because the gap
-    is invisible in review. -#}
-{%- set is_home = current_path is defined and current_path == "/" -%}
+{%- set is_home = current_url is defined and current_url == get_url(path='@/_index.md') -%}
 {%- if is_home -%}
   {%- set page_title = "krafka — a pure-Rust Apache Kafka client" -%}
-{%- elif page.title -%}
+{%- elif page is defined and page.title -%}
   {%- set page_title = page.title ~ " · krafka" -%}
-{%- elif section.title -%}
+{%- elif section is defined and section.title -%}
   {%- set page_title = section.title ~ " · krafka" -%}
 {%- else -%}
   {%- set page_title = config.title -%}
 {%- endif -%}
-{%- set descr = page.description | default(value=section.description) | default(value=config.description) -%}
+{%- if page is defined and page.description -%}
+  {%- set descr = page.description -%}
+{%- elif section is defined and section.description -%}
+  {%- set descr = section.description -%}
+{%- else -%}
+  {%- set descr = config.description -%}
+{%- endif -%}
 {%- set canonical = current_url | default(value=config.base_url) -%}
 {%- set og_image = get_url(path=config.extra.og_image) -%}
 
@@ -34,9 +29,7 @@
 <meta name="description" content="{{ descr }}">
 <link rel="canonical" href="{{ canonical | safe }}">
 
-{#- Open Graph and X/Twitter. `summary_large_image` needs an absolute image
-    URL, which is why `og_image` goes through `get_url`. -#}
-<meta property="og:type" content="{% if page.title %}article{% else %}website{% endif %}">
+<meta property="og:type" content="{% if page is defined and page.title %}article{% else %}website{% endif %}">
 <meta property="og:site_name" content="krafka">
 <meta property="og:title" content="{{ page_title }}">
 <meta property="og:description" content="{{ descr }}">
@@ -54,22 +47,12 @@
 <link rel="icon" href="{{ get_url(path='favicon.svg') | safe }}" type="image/svg+xml">
 <link rel="alternate" type="application/atom+xml" title="krafka" href="{{ get_url(path='atom.xml') | safe }}">
 
-{#- One stylesheet plus the two syntax themes giallo generates.
-
-    The syntax themes cannot be swapped by `data-theme` the way the site
-    palette is: giallo emits the same class names in both files, so whichever
-    loads second always wins. The dark sheet is therefore gated by its `media`
-    attribute, which the script below rewrites when the reader picks a theme
-    explicitly. Defaulting it to the OS preference means a reader who never
-    touches the toggle gets the right colours with no script at all. -#}
+{#- Syntax themes share class names; the media attribute selects the active theme. -#}
 <link rel="stylesheet" href="{{ get_url(path='main.css', cachebust=true) | safe }}">
 <link rel="stylesheet" href="{{ get_url(path='giallo-light.css') | safe }}">
 <link rel="stylesheet" id="syntax-dark" href="{{ get_url(path='giallo-dark.css') | safe }}" media="(prefers-color-scheme: dark)">
 
-{#- Structured data. `SoftwareSourceCode` is the accurate type for a library;
-    `SoftwareApplication` would imply something a person installs and runs.
-    Values go through `json_encode` so a quote in a description cannot break
-    the document. -#}
+{#- json_encode protects structured data from quotes in metadata. -#}
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -86,7 +69,7 @@
   "keywords": "apache kafka, rust, kafka client, async, tokio, librdkafka alternative, kafka protocol, KIP-848, KIP-932, exactly-once, share groups"
 }
 </script>
-{%- if page.title %}
+{%- if page is defined and page.title %}
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -112,16 +95,14 @@
 </script>
 {%- endif %}
 
-{#- Theme resolution runs before first paint so a dark-mode reader never sees a
-    white flash. It is the only blocking script on the page. -#}
+{#- Resolve the theme before first paint to prevent a colour flash. -#}
 <script>
   (function () {
     var stored = null;
     try { stored = localStorage.getItem("krafka-theme"); } catch (e) {}
     var theme = stored || "auto";
     document.documentElement.setAttribute("data-theme", theme);
-    // Runs before <body> so the syntax sheet is already correct at first
-    // paint. `app.js` reuses this function for the toggle.
+    // Set syntax colours before first paint; app.js reuses this hook.
     window.krafkaSyntaxTheme = function (t) {
       var link = document.getElementById("syntax-dark");
       if (!link) return;
@@ -143,7 +124,7 @@
       <span>krafka</span>
     </a>
     <nav class="site-nav" aria-label="Main">
-      <a href="{{ get_url(path='@/docs/_index.md') | safe }}"{% if current_path is starting_with("/krafka/docs") %} aria-current="page"{% endif %}>Docs</a>
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}"{% if current_path is defined and "/docs/" in current_path %} aria-current="page"{% endif %}>Docs</a>
       <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
       <a href="{{ config.extra.crate }}" rel="noopener">Crates.io</a>
       <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>

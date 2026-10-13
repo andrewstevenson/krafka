@@ -15,6 +15,9 @@ use super::driver::{Mode, Target, answer, exchange, negotiate};
 use super::offsets::{ListOffsetsOptions, OffsetSpec};
 use super::{AdminClient, validate_topics};
 
+/// Last OffsetFetch/OffsetCommit version carrying topic names in both directions.
+const NAME_BASED_OFFSET_MAX: i16 = 9;
+
 /// A committed offset.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +147,7 @@ impl AdminClient {
                     &conn,
                     ApiKey::OffsetFetch,
                     versions::OFFSET_FETCH_MIN,
-                    versions::OFFSET_FETCH_MAX,
+                    NAME_BASED_OFFSET_MAX,
                 )?;
                 let response: OffsetFetchResponse =
                     exchange(&conn, ApiKey::OffsetFetch, version, &request).await?;
@@ -233,7 +236,7 @@ impl AdminClient {
                         &conn,
                         ApiKey::OffsetCommit,
                         versions::OFFSET_COMMIT_MIN,
-                        versions::OFFSET_COMMIT_MAX,
+                        NAME_BASED_OFFSET_MAX,
                     )?;
                     let response: OffsetCommitResponse =
                         exchange(&conn, ApiKey::OffsetCommit, version, &request).await?;

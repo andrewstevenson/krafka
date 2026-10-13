@@ -1,6 +1,6 @@
 [package]
 name = "krafka"
-version = "0.27.0"
+version = "0.27.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["hupe1980"]
@@ -36,7 +36,7 @@ tracing = "0.1.41"
 flate2 = "1"                                          # gzip
 snap = "1"                                            # snappy
 lz4_flex = "0.11.6"                                   # lz4
-ruzstd = "0.8"                                        # zstd decode (pure Rust, always on)
+ruzstd = "0.9.1"                                      # zstd decode (pure Rust, always on)
 zstd = { version = "0.13", optional = true }          # zstd encode (requires C toolchain via zstd-sys)
 
 # CRC32 for protocol

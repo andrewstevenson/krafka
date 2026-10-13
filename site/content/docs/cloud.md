@@ -140,10 +140,12 @@ impl CredentialProvider<OAuthBearerToken> for GoogleManagedKafka {
         let (access_token, expires_at) = google_access_token().await?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let header = r#"{"typ":"JWT","alg":"GOOG_OAUTH2_TOKEN"}"#;
-        let claims = format!(
-            r#"{{"exp":{expires_at},"iat":{now},"scope":"kafka","sub":"{}"}}"#,
-            self.principal
-        );
+        let claims = serde_json::json!({
+            "exp": expires_at,
+            "iat": now,
+            "scope": "kafka",
+            "sub": self.principal,
+        }).to_string();
         let token = format!(
             "{}.{}.{}",
             URL_SAFE_NO_PAD.encode(header),
@@ -163,7 +165,7 @@ let kafka = Kafka::builder("bootstrap.my-cluster.us-central1.managedkafka.my-pro
     .await?;
 ```
 
-The snippet uses the `base64` crate (`cargo add base64`).
+The snippet uses `base64` and `serde_json` (`cargo add base64 serde_json`).
 
 ### PLAIN with an access token
 

@@ -199,7 +199,17 @@ impl OffsetCommitRequest {
     }
 
     /// Encode for version 10 (topic ID replaces topic name, KIP-848).
+    /// Rejects missing or zero topic IDs before writing any bytes.
     pub fn encode_v10(&self, buf: &mut impl BufMut) -> Result<()> {
+        let topic_ids = self.topics.iter().map(|topic| {
+            topic.topic_id.filter(|id| *id != [0; 16]).ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidValue,
+                    "OffsetCommit v10 requires a nonzero topic ID",
+                )
+            })
+        });
+        topic_ids.clone().try_for_each(|id| id.map(|_| ()))?;
         KafkaString::new(&self.group_id).try_encode_compact(buf)?;
         self.generation_id.encode(buf);
         KafkaString::new(&self.member_id).try_encode_compact(buf)?;
@@ -212,8 +222,8 @@ impl OffsetCommitRequest {
             KrafkaError::protocol_kind(ProtocolErrorKind::InvalidLength, "topics array too large")
         })?;
         crate::util::varint::encode_unsigned_varint(topics_len, buf);
-        for topic in &self.topics {
-            buf.put_slice(&topic.topic_id.unwrap_or([0u8; 16]));
+        for (topic, topic_id) in self.topics.iter().zip(topic_ids) {
+            buf.put_slice(&topic_id?);
             let parts_len =
                 u32::try_from(topic.partitions.len().saturating_add(1)).map_err(|_| {
                     KrafkaError::protocol_kind(
@@ -868,6 +878,29 @@ mod tests {
     }
 
     // ── OffsetCommit v10 (topic_id) ──
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::zero(Some([0; 16]))]
+    fn offset_commit_v10_rejects_invalid_topic_ids(#[case] topic_id: Option<[u8; 16]>) {
+        let mut request = sample_offset_commit_request();
+        request.topics[0].topic_id = Some([1; 16]);
+        request.topics.push(OffsetCommitRequestTopic {
+            name: "topic-2".into(),
+            topic_id,
+            partitions: vec![],
+        });
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        assert!(matches!(
+            request.encode_versioned(10, &mut buf),
+            Err(KrafkaError::Protocol {
+                kind: ProtocolErrorKind::InvalidValue,
+                ..
+            })
+        ));
+        assert_eq!(&buf[..], b"prefix");
+        request.encode_versioned(9, &mut BytesMut::new()).unwrap();
+    }
 
     #[test]
     fn test_offset_commit_request_encode_v10_topic_id() {

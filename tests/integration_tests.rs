@@ -337,6 +337,104 @@ async fn test_producer_send_receive() {
 
 #[tokio::test]
 #[ignore = "requires Docker"]
+async fn test_admin_group_offsets_round_trip_and_lag() {
+    use krafka::admin::{ListConsumerGroupOffsetsOptions, NewTopic, TopicPartition};
+
+    let bootstrap_servers = kafka();
+    let client = krafka::Kafka::builder(&bootstrap_servers)
+        .connect()
+        .await
+        .unwrap();
+    let admin = client.admin();
+    let topics = ["admin-offset-roundtrip-a", "admin-offset-roundtrip-b"];
+    let created = admin
+        .create_topics(
+            topics
+                .iter()
+                .map(|topic| NewTopic::new(*topic, 1, 1).unwrap()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.len(), 2);
+    for topic in topics {
+        created[topic].as_ref().unwrap();
+    }
+    tokio::time::sleep(TOPIC_READY).await;
+    let producer = client.producer().build().await.unwrap();
+    for topic in topics {
+        for expected in 0..8 {
+            let record = producer
+                .send(krafka::Record::new(topic, "value"))
+                .await
+                .unwrap();
+            assert_eq!(record.partition, 0);
+            assert_eq!(record.offset, expected);
+        }
+    }
+    let group = "admin-offset-roundtrip-group";
+    let first = TopicPartition::new(topics[0], 0);
+    let second = TopicPartition::new(topics[1], 0);
+    let changed = admin
+        .alter_consumer_group_offsets(
+            group,
+            [(first.clone(), 3), (second.clone(), 5)],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.len(), 2);
+    assert!(changed[&first].is_ok());
+    assert!(changed[&second].is_ok());
+
+    for options in [
+        ListConsumerGroupOffsetsOptions::default(),
+        ListConsumerGroupOffsetsOptions::default()
+            .partitions(vec![first.clone(), second.clone()])
+            .require_stable(true),
+    ] {
+        let fetched = admin
+            .list_consumer_group_offsets(group, options)
+            .await
+            .unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[&first].as_ref().unwrap().offset, Some(3));
+        assert_eq!(fetched[&second].as_ref().unwrap().offset, Some(5));
+    }
+    let lag = admin
+        .consumer_group_lag(group, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(lag.len(), 2);
+    for (partition, committed, expected_lag) in [(&first, 3, 5), (&second, 5, 3)] {
+        let value = lag[partition].as_ref().unwrap();
+        assert_eq!(value.committed_offset, Some(committed));
+        assert_eq!(value.end_offset, 8);
+        assert_eq!(value.lag, Some(expected_lag));
+    }
+    let reset = admin
+        .alter_consumer_group_offsets(
+            group,
+            [(first.clone(), 0), (second.clone(), 8)],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.len(), 2);
+    assert!(reset[&first].is_ok());
+    assert!(reset[&second].is_ok());
+    let lag = admin
+        .consumer_group_lag(group, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(lag[&first].as_ref().unwrap().lag, Some(8));
+    assert_eq!(lag[&second].as_ref().unwrap().lag, Some(0));
+    producer.close().await.unwrap();
+    admin.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
 async fn test_admin_client() {
     use krafka::admin::NewTopic;
 

@@ -61,9 +61,9 @@ send cannot commit. Per-partition order is structural: one send path, at most
 five requests in flight per broker, and a retry cannot reorder a partition.
 
 **Protocol currency is mechanical.** The API version table is diffed against
-Kafka's message schemas (`just protocol-parity`), every version is negotiated
-through `ApiVersions`, and a broker from 3.9 onwards gets the versions it
-supports with no configuration.
+Kafka's message schemas (`just protocol-parity`). Each request negotiates a
+compatible version through `ApiVersions`; Kafka 3.9+ needs no manual version
+configuration.
 
 **Your code is testable without Docker.** The `test-broker` feature ships an
 in-process fake Kafka cluster with fault injection; see

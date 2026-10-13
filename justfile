@@ -107,8 +107,8 @@ check:
     cargo check --all-targets --all-features
 
 # Full test suite with every feature enabled.
-test:
-    cargo test --all-features
+test *args:
+    cargo test --all-features {{args}}
 
 # Test with the *default* crypto backend, which is what most downstream users
 # compile. Type-checking is not enough here: the ring-only arms have to run.
@@ -511,7 +511,7 @@ integration-matrix versions="3.9.0 4.0.0 4.1.0 4.2.0 4.3.0":
 # Run one Docker-backed test binary, then remove the container it started.
 # The shared container outlives the test process, so it is removed by label;
 # one left by an interrupted run is removed first.
-_docker-suite binary:
+_docker-suite binary filter="":
     #!/usr/bin/env bash
     set -euo pipefail
     if ! docker info >/dev/null 2>&1; then
@@ -521,7 +521,7 @@ _docker-suite binary:
     cleanup() { docker ps -aq --filter "label=krafka.test-suite={{binary}}" | xargs -r docker rm -f >/dev/null 2>&1 || true; }
     cleanup
     trap cleanup EXIT
-    cargo test --test {{binary}} -- --ignored --test-threads=1
+    cargo test --test {{binary}} {{filter}} -- --ignored --test-threads=1
 
 # API changes against the last published release.
 #

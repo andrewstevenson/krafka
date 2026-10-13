@@ -14,14 +14,14 @@ use krafka::__private::metadata::ClusterMetadata;
 use krafka::__private::network::{ConnectionConfig, ConnectionPool};
 use krafka::Kafka;
 use krafka::admin::{
-    AdminClient, ConfigResource, CreateTopicsOptions, DescribeConfigsOptions,
-    DescribeConsumerGroupsOptions, ListConsumerGroupOffsetsOptions, ListOffsetsOptions, NewTopic,
-    OffsetSpec, TopicPartition,
+    AdminClient, AlterConsumerGroupOffsetsOptions, ConfigResource, ConsumerGroupLagOptions,
+    CreateTopicsOptions, DescribeConfigsOptions, DescribeConsumerGroupsOptions,
+    ListConsumerGroupOffsetsOptions, ListOffsetsOptions, NewTopic, OffsetSpec, TopicPartition,
 };
 use krafka::auth::{AuthConfig, TlsConfig};
 use krafka::error::{ErrorCode, KrafkaError};
 use krafka::testing::ApiKey;
-use krafka::testing::{Control, FakeBroker};
+use krafka::testing::{CommittedOffset, Control, FakeBroker};
 
 async fn shared(broker: &FakeBroker) -> (Kafka, AdminClient) {
     let client = krafka::Kafka::builder(broker.bootstrap_servers())
@@ -345,8 +345,267 @@ async fn a4_broker_config_is_described_by_that_broker() {
     );
 }
 
-/// A coordinator still loading is retried, and a group-level error keeps its
-/// code.
+/// Named offsets and lag survive legacy, flexible and batched requests.
+#[rstest::rstest]
+#[case::v10_advertised((5, 10), (7, 10), (9, 9))]
+#[case::legacy((5, 5), (7, 7), (5, 7))]
+#[case::flexible((6, 6), (8, 8), (6, 8))]
+#[case::stable((7, 7), (8, 8), (7, 8))]
+#[case::batched((8, 8), (9, 9), (8, 9))]
+#[tokio::test]
+async fn admin_group_offsets_round_trip_preserves_names_and_lag(
+    #[case] fetch_range: (i16, i16),
+    #[case] commit_range: (i16, i16),
+    #[case] expected_versions: (i16, i16),
+) {
+    let broker = FakeBroker::start_cluster(2).await.unwrap();
+    broker.set_api_versions(ApiKey::OffsetFetch, fetch_range.0, fetch_range.1);
+    broker.set_api_versions(ApiKey::OffsetCommit, commit_range.0, commit_range.1);
+    broker.create_topic("a", 2);
+    broker.create_topic("b", 1);
+    broker.set_group_coordinator("g", 1);
+    broker.with_state(|state| {
+        state
+            .topics
+            .get_mut("a")
+            .unwrap()
+            .partitions
+            .get_mut(0)
+            .unwrap()
+            .next_offset = 20;
+        state
+            .topics
+            .get_mut("b")
+            .unwrap()
+            .partitions
+            .get_mut(0)
+            .unwrap()
+            .next_offset = 30;
+        let group = state.groups.entry("g".into()).or_default();
+        for (name, offset, epoch) in [("a", 7, 3), ("b", 11, 5)] {
+            group.offsets.insert(
+                (name.into(), 0),
+                CommittedOffset {
+                    offset,
+                    leader_epoch: epoch,
+                    metadata: Some(format!("{name}-metadata")),
+                },
+            );
+        }
+    });
+    let (_client, admin) = shared(&broker).await;
+    let first = TopicPartition::new("a", 0);
+    let second = TopicPartition::new("b", 0);
+    let uncommitted = TopicPartition::new("a", 1);
+    let partitions = vec![first.clone(), second.clone(), uncommitted.clone()];
+    let fetched = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default()
+                .partitions(partitions.clone())
+                .require_stable(fetch_range.1 >= 7)
+                .timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetched.len(), 3);
+    for (tp, offset, epoch, metadata) in [
+        (&first, Some(7), Some(3), Some("a-metadata")),
+        (&second, Some(11), Some(5), Some("b-metadata")),
+        (&uncommitted, None, None, None),
+    ] {
+        let value = fetched[tp].as_ref().unwrap();
+        assert_eq!(value.offset, offset);
+        assert_eq!(value.leader_epoch, epoch);
+        assert_eq!(value.metadata.as_deref(), metadata);
+    }
+    let all = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[&first].as_ref().unwrap().offset, Some(7));
+    assert_eq!(all[&second].as_ref().unwrap().offset, Some(11));
+    let empty = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default()
+                .partitions(vec![])
+                .timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+
+    let lag = admin
+        .consumer_group_lag(
+            "g",
+            ConsumerGroupLagOptions::default()
+                .partitions(partitions)
+                .timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lag.len(), 3);
+    for (tp, committed, end, expected_lag) in [
+        (&first, Some(7), 20, Some(13)),
+        (&second, Some(11), 30, Some(19)),
+        (&uncommitted, None, 0, None),
+    ] {
+        let value = lag[tp].as_ref().unwrap();
+        assert_eq!(value.committed_offset, committed);
+        assert_eq!(value.end_offset, end);
+        assert_eq!(value.lag, expected_lag);
+    }
+    let altered = admin
+        .alter_consumer_group_offsets(
+            "g",
+            [(first.clone(), 9), (second.clone(), 17)],
+            AlterConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(altered.len(), 2);
+    assert!(altered[&first].is_ok());
+    assert!(altered[&second].is_ok());
+    let after = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 2);
+    for (tp, expected) in [(&first, 9), (&second, 17)] {
+        let value = after[tp].as_ref().unwrap();
+        assert_eq!(value.offset, Some(expected));
+        assert_eq!(value.leader_epoch, None);
+        assert_eq!(value.metadata, None);
+    }
+    for (api, expected) in [
+        (ApiKey::OffsetFetch, expected_versions.0),
+        (ApiKey::OffsetCommit, expected_versions.1),
+    ] {
+        let requests: Vec<_> = broker
+            .requests()
+            .into_iter()
+            .filter(|request| request.api_key == api)
+            .collect();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.api_version == expected && request.node_id == 1),
+            "{api:?}: {requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_group_offsets_preserve_broker_errors_with_v10_advertised() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.set_api_versions(ApiKey::OffsetFetch, 5, 10);
+    broker.set_api_versions(ApiKey::OffsetCommit, 7, 10);
+    broker.create_topic("a", 1);
+    broker.create_topic("b", 1);
+    let (_client, admin) = shared(&broker).await;
+    broker.on_once(ApiKey::OffsetFetch, |_| {
+        Control::Error(ErrorCode::GroupAuthorizationFailed)
+    });
+    let result = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await;
+    assert!(is_code(&result, ErrorCode::GroupAuthorizationFailed));
+    broker.on_once(ApiKey::OffsetCommit, |_| {
+        Control::Error(ErrorCode::TopicAuthorizationFailed)
+    });
+    let first = TopicPartition::new("a", 0);
+    let second = TopicPartition::new("b", 0);
+    let results = admin
+        .alter_consumer_group_offsets(
+            "g",
+            [(first.clone(), 9), (second.clone(), 17)],
+            AlterConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(is_code(
+        &results[&first],
+        ErrorCode::TopicAuthorizationFailed
+    ));
+    assert!(is_code(
+        &results[&second],
+        ErrorCode::TopicAuthorizationFailed
+    ));
+    broker.on_once(ApiKey::OffsetFetch, |_| {
+        Control::Error(ErrorCode::CoordinatorLoadInProgress)
+    });
+    let result = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+    assert_eq!(broker.request_count(ApiKey::OffsetFetch), 3);
+    assert_eq!(broker.request_count(ApiKey::OffsetCommit), 1);
+    assert!(
+        broker
+            .requests()
+            .iter()
+            .filter(|request| matches!(request.api_key, ApiKey::OffsetFetch | ApiKey::OffsetCommit))
+            .all(|request| request.api_version == 9)
+    );
+}
+
+#[tokio::test]
+async fn admin_group_offsets_fail_closed_when_only_v10_is_supported() {
+    let broker = FakeBroker::start().await.unwrap();
+    broker.set_api_versions(ApiKey::OffsetFetch, 10, 10);
+    broker.set_api_versions(ApiKey::OffsetCommit, 10, 10);
+    let (_client, admin) = shared(&broker).await;
+    let result = admin
+        .list_consumer_group_offsets(
+            "g",
+            ListConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(KrafkaError::Protocol {
+            kind: krafka::error::ProtocolErrorKind::UnknownApiVersion,
+            ..
+        })
+    ));
+    let partition = TopicPartition::new("a", 0);
+    let result = admin
+        .alter_consumer_group_offsets(
+            "g",
+            [(partition.clone(), 1)],
+            AlterConsumerGroupOffsetsOptions::default().timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result[&partition],
+        Err(KrafkaError::Protocol {
+            kind: krafka::error::ProtocolErrorKind::UnknownApiVersion,
+            ..
+        })
+    ));
+    assert_eq!(broker.request_count(ApiKey::OffsetFetch), 0);
+    assert_eq!(broker.request_count(ApiKey::OffsetCommit), 0);
+}
+
+/// A loading coordinator is retried until the fetch succeeds.
 #[tokio::test]
 async fn a5_offset_fetch_broker_error_keeps_its_code_and_retries() {
     let broker = FakeBroker::start().await.unwrap();
@@ -357,17 +616,11 @@ async fn a5_offset_fetch_broker_error_keeps_its_code_and_retries() {
     let result = admin
         .list_consumer_group_offsets("g", ListConsumerGroupOffsetsOptions::default())
         .await;
-    match result {
-        Ok(_) => {}
-        Err(KrafkaError::Broker {
-            code: ErrorCode::CoordinatorLoadInProgress,
-            ..
-        }) => {}
-        Err(other) => panic!(
-            "retriable coordinator error surfaced as {other:?} (retriable={})",
-            other.is_retriable()
-        ),
-    }
+    assert!(
+        result
+            .expect("fetch must succeed after the coordinator finishes loading")
+            .is_empty()
+    );
     assert_eq!(
         broker.request_count(ApiKey::OffsetFetch),
         2,
