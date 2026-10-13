@@ -152,7 +152,7 @@ pub(crate) fn dispatch(
         ApiKey::Heartbeat => heartbeat(body, node_id, state, out),
         ApiKey::LeaveGroup => leave_group(body, node_id, state, out),
         ApiKey::OffsetCommit => offset_commit(body, api_version, node_id, state, out),
-        ApiKey::OffsetFetch => offset_fetch(body, node_id, state, out),
+        ApiKey::OffsetFetch => offset_fetch(body, api_version, node_id, state, out),
         ApiKey::ConsumerGroupHeartbeat => consumer_group_heartbeat(body, node_id, state, out),
         ApiKey::InitProducerId => init_producer_id(body, api_version, node_id, state, out),
         ApiKey::AddPartitionsToTxn => add_partitions_to_txn(body, api_version, node_id, state, out),
@@ -384,11 +384,15 @@ pub(crate) fn dispatch_error(
             write_offset_commit_response(out, api_version, &req, code)
         }
         ApiKey::OffsetFetch => {
-            let _ = OffsetFetchReq::read(body)?;
-            out.put_i32(0);
-            write_array_len(out, 0)?;
-            write_error(out, code);
-            Ok(())
+            let req = OffsetFetchReq::read(body, api_version)?;
+            write_offset_fetch_response(
+                out,
+                api_version,
+                &req.group_id,
+                &[],
+                &Default::default(),
+                code,
+            )
         }
         ApiKey::InitProducerId => {
             let _ = InitProducerIdReq::read(body, api_version)?;
@@ -2371,17 +2375,22 @@ const NO_COMMITTED_OFFSET: i64 = -1;
 
 fn offset_fetch(
     body: &mut Bytes,
+    api_version: i16,
     node_id: i32,
     state: &mut ClusterState,
     out: &mut BytesMut,
 ) -> Result<()> {
-    let req = OffsetFetchReq::read(body)?;
+    let req = OffsetFetchReq::read(body, api_version)?;
 
     if let Some(code) = coordinator_check(state, &req.group_id, node_id) {
-        out.put_i32(0);
-        write_array_len(out, 0)?;
-        write_error(out, code);
-        return Ok(());
+        return write_offset_fetch_response(
+            out,
+            api_version,
+            &req.group_id,
+            &[],
+            &Default::default(),
+            code,
+        );
     }
 
     let group = state.groups.entry(req.group_id.clone()).or_default();
@@ -2404,30 +2413,70 @@ fn offset_fetch(
         }
     };
 
-    out.put_i32(0); // throttle_time_ms
-    write_array_len(out, requested.len())?;
-    for (name, partitions) in &requested {
-        write_string(out, name)?;
-        write_array_len(out, partitions.len())?;
+    write_offset_fetch_response(
+        out,
+        api_version,
+        &req.group_id,
+        &requested,
+        &group.offsets,
+        ErrorCode::None,
+    )
+}
+
+fn write_offset_fetch_response(
+    out: &mut BytesMut,
+    version: i16,
+    group_id: &str,
+    requested: &[(String, Vec<i32>)],
+    offsets: &std::collections::HashMap<(String, i32), CommittedOffset>,
+    code: ErrorCode,
+) -> Result<()> {
+    let flexible = version >= 6;
+    out.put_i32(0);
+    if version >= 8 {
+        write_compact_array_len(out, 1)?;
+        write_compact_string(out, group_id)?;
+    }
+    if flexible {
+        write_compact_array_len(out, requested.len())?;
+    } else {
+        write_array_len(out, requested.len())?;
+    }
+    for (name, partitions) in requested {
+        if flexible {
+            write_compact_string(out, name)?;
+            write_compact_array_len(out, partitions.len())?;
+        } else {
+            write_string(out, name)?;
+            write_array_len(out, partitions.len())?;
+        }
         for partition in partitions {
             out.put_i32(*partition);
-            match group.offsets.get(&(name.clone(), *partition)) {
-                Some(committed) => {
-                    out.put_i64(committed.offset);
-                    out.put_i32(committed.leader_epoch);
-                    write_nullable_string(out, committed.metadata.as_deref())?;
-                    write_error(out, ErrorCode::None);
-                }
-                None => {
-                    out.put_i64(NO_COMMITTED_OFFSET);
-                    out.put_i32(-1);
-                    write_nullable_string(out, None)?;
-                    write_error(out, ErrorCode::None);
-                }
+            let committed = offsets.get(&(name.clone(), *partition));
+            out.put_i64(committed.map_or(NO_COMMITTED_OFFSET, |offset| offset.offset));
+            out.put_i32(committed.map_or(-1, |offset| offset.leader_epoch));
+            let metadata = committed.and_then(|offset| offset.metadata.as_deref());
+            if flexible {
+                write_compact_nullable_string(out, metadata)?;
+            } else {
+                write_nullable_string(out, metadata)?;
+            }
+            write_error(out, ErrorCode::None);
+            if flexible {
+                write_empty_tagged_fields(out)?;
             }
         }
+        if flexible {
+            write_empty_tagged_fields(out)?;
+        }
     }
-    write_error(out, ErrorCode::None); // top-level error_code
+    write_error(out, code);
+    if version >= 8 {
+        write_empty_tagged_fields(out)?;
+    }
+    if flexible {
+        write_empty_tagged_fields(out)?;
+    }
     Ok(())
 }
 

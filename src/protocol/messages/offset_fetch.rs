@@ -103,7 +103,17 @@ impl OffsetFetchRequest {
     }
 
     /// Encode for version 10 (topic ID replaces topic name, KIP-848).
+    /// Rejects missing or zero topic IDs before writing any bytes.
     pub fn encode_v10(&self, buf: &mut impl BufMut) -> Result<()> {
+        let topic_ids = self.topics.iter().flatten().map(|topic| {
+            topic.topic_id.filter(|id| *id != [0; 16]).ok_or_else(|| {
+                KrafkaError::protocol_kind(
+                    ProtocolErrorKind::InvalidValue,
+                    "OffsetFetch v10 requires a nonzero topic ID",
+                )
+            })
+        });
+        topic_ids.clone().try_for_each(|id| id.map(|_| ()))?;
         // Groups compact array: 1 element
         crate::util::varint::encode_unsigned_varint(2, buf);
         KafkaString::new(&self.group_id).try_encode_compact(buf)?;
@@ -122,8 +132,8 @@ impl OffsetFetchRequest {
                     )
                 })?;
                 crate::util::varint::encode_unsigned_varint(len, buf);
-                for topic in topics {
-                    buf.put_slice(&topic.topic_id.unwrap_or([0u8; 16]));
+                for (topic, topic_id) in topics.iter().zip(topic_ids) {
+                    buf.put_slice(&topic_id?);
                     let parts_len = u32::try_from(topic.partition_indexes.len().saturating_add(1))
                         .map_err(|_| {
                             KrafkaError::protocol_kind(
@@ -936,6 +946,42 @@ mod tests {
     }
 
     // ── OffsetFetch v10 (topic_id in Groups wrapper) ──
+
+    #[rstest]
+    #[case::missing(None)]
+    #[case::zero(Some([0; 16]))]
+    fn offset_fetch_v10_rejects_invalid_topic_ids(#[case] topic_id: Option<[u8; 16]>) {
+        let mut request = sample_offset_fetch_request();
+        request.topics.as_mut().unwrap()[0].topic_id = Some([1; 16]);
+        request
+            .topics
+            .as_mut()
+            .unwrap()
+            .push(OffsetFetchRequestTopic {
+                name: "topic-2".into(),
+                topic_id,
+                partition_indexes: vec![0],
+            });
+        let mut buf = BytesMut::from(&b"prefix"[..]);
+        assert!(matches!(
+            request.encode_versioned(10, &mut buf),
+            Err(KrafkaError::Protocol {
+                kind: ProtocolErrorKind::InvalidValue,
+                ..
+            })
+        ));
+        assert_eq!(&buf[..], b"prefix");
+        request.encode_versioned(9, &mut BytesMut::new()).unwrap();
+    }
+
+    #[test]
+    fn offset_fetch_v10_accepts_all_topics_and_empty_topics() {
+        let mut request = sample_offset_fetch_request();
+        for topics in [None, Some(vec![])] {
+            request.topics = topics;
+            request.encode_versioned(10, &mut BytesMut::new()).unwrap();
+        }
+    }
 
     #[test]
     fn test_offset_fetch_request_encode_v10_topic_id() {

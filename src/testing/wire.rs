@@ -1084,9 +1084,7 @@ impl OffsetCommitReq {
     }
 }
 
-/// OffsetFetch request, v5 wire format.
-///
-/// Mirrors `OffsetFetchRequest::encode_v1` (which covers v1–v5).
+/// OffsetFetch request, v5-v9 name-based wire formats.
 #[derive(Debug, Clone)]
 pub(crate) struct OffsetFetchReq {
     /// Group whose offsets are being read.
@@ -1096,24 +1094,75 @@ pub(crate) struct OffsetFetchReq {
 }
 
 impl OffsetFetchReq {
-    pub(crate) fn read(buf: &mut impl Buf) -> Result<Self> {
-        let group_id = read_string(buf)?;
-        let topics = match read_nullable_array_len(buf)? {
+    pub(crate) fn read(buf: &mut impl Buf, version: i16) -> Result<Self> {
+        if !(5..=9).contains(&version) {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::UnknownApiVersion,
+                "fake broker supports OffsetFetch v5-v9",
+            ));
+        }
+        let flexible = version >= 6;
+        if version >= 8 && read_compact_array_len(buf)? != 1 {
+            return Err(KrafkaError::protocol_kind(
+                ProtocolErrorKind::Malformed,
+                "fake broker expects one OffsetFetch group",
+            ));
+        }
+        let group_id = if flexible {
+            read_compact_string(buf)?
+        } else {
+            read_string(buf)?
+        };
+        if version >= 9 {
+            let _member_id = read_compact_nullable_string(buf)?;
+            let _member_epoch = i32::decode(buf)?;
+        }
+        let count = if flexible {
+            let raw = crate::util::varint::decode_unsigned_varint(buf)?;
+            if raw == 0 {
+                None
+            } else {
+                Some(check_len((raw - 1) as usize)?)
+            }
+        } else {
+            read_nullable_array_len(buf)?
+        };
+        let topics = match count {
             None => None,
             Some(count) => {
                 let mut topics = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let name = read_string(buf)?;
-                    let partition_count = read_array_len(buf)?;
+                    let name = if flexible {
+                        read_compact_string(buf)?
+                    } else {
+                        read_string(buf)?
+                    };
+                    let partition_count = if flexible {
+                        read_compact_array_len(buf)?
+                    } else {
+                        read_array_len(buf)?
+                    };
                     let mut partitions = Vec::with_capacity(partition_count);
                     for _ in 0..partition_count {
                         partitions.push(i32::decode(buf)?);
+                    }
+                    if flexible {
+                        skip_tagged_fields(buf)?;
                     }
                     topics.push((name, partitions));
                 }
                 Some(topics)
             }
         };
+        if version >= 8 {
+            skip_tagged_fields(buf)?;
+        }
+        if version >= 7 {
+            let _require_stable = bool::decode(buf)?;
+        }
+        if flexible {
+            skip_tagged_fields(buf)?;
+        }
         Ok(Self { group_id, topics })
     }
 }

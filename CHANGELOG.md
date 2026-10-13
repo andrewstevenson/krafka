@@ -13,6 +13,14 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-10-13
+
+### Fixed
+
+- Consumer group offset listing, alteration and lag on Kafka 4.x use name-based requests through v9 ([#68](https://github.com/hupe1980/krafka/issues/68)).
+- OffsetFetch and OffsetCommit v10 reject missing or zero topic IDs before encoding.
+- Require `ruzstd` 0.9.1 or newer, excluding versions affected by RUSTSEC-2026-0344.
+
 ## [0.27.0] — 2026-10-09
 
 Every client is built from one `Kafka` handle. The [upgrading guide](https://hupe1980.github.io/krafka/docs/upgrading/) maps each changed or removed name.
@@ -1675,7 +1683,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/hupe1980/krafka/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/hupe1980/krafka/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/hupe1980/krafka/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/hupe1980/krafka/compare/v0.24.0...v0.25.0

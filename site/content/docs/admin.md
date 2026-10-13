@@ -410,6 +410,9 @@ for (broker, listing) in &per_broker {
 
 ### Committed offsets and lag
 
+Offset results are keyed by topic name and partition, including when listing
+all committed offsets.
+
 ```rust,compile
 use krafka::admin::{ConsumerGroupLagOptions, ListConsumerGroupOffsetsOptions, TopicPartition};
 

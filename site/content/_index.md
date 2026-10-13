@@ -1,6 +1,6 @@
 +++
 title = "krafka — a pure-Rust Apache Kafka client"
-description = "krafka is a pure-Rust, async-native Apache Kafka client. No C library, no system dependency, no unsafe, no panics on malformed input."
+description = "A pure-Rust async Apache Kafka client on Tokio, with producers, transactions, consumer groups, share groups and admin APIs."
 template = "index.html"
 
 [extra]
