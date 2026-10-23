@@ -26,7 +26,7 @@ async fn tls_config_builds_without_an_installed_crypto_provider() {
     );
 
     let config = TlsConfig::new();
-    krafka::__private::tls::build_tls_config(&config)
+    krafka::__private::tls::build_tls_config(&config, std::time::Duration::from_secs(30))
         .await
         .expect("building a verifying TLS config must not depend on rustls crate features");
 }
@@ -36,7 +36,7 @@ async fn tls_config_builds_without_an_installed_crypto_provider() {
 #[tokio::test]
 async fn insecure_tls_config_builds_without_an_installed_crypto_provider() {
     let config = TlsConfig::insecure();
-    krafka::__private::tls::build_tls_config(&config)
+    krafka::__private::tls::build_tls_config(&config, std::time::Duration::from_secs(30))
         .await
         .expect("building an insecure TLS config must not depend on rustls crate features");
 }

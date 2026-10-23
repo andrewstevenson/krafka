@@ -57,6 +57,7 @@ EXEMPT = {
     ("ConnectionConfig", "send_buffer_size"): "set via socket_send_buffer()",
     ("ConnectionConfig", "recv_buffer_size"): "set via socket_receive_buffer()",
     ("ConnectionConfig", "tls_connector"): "built from auth/TLS config by init_tls()",
+    ("ConnectionConfig", "tls_reload"): "a lock serialising refresh_tls(), not a setting",
     ("ConnectionConfig", "msk_iam_clock_offset_secs"): "learned from broker clock skew at handshake time",
     ("KafkaBuilder", "connector"): "test seam (test-broker): installed by testing::FakeBroker::kafka(), not a setting",
     ("ConnectionConfig", "connector"): "test seam (test-broker): copied from KafkaBuilder, not a setting",

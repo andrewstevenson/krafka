@@ -84,7 +84,7 @@ The transport settings below are connection settings too.
 | `connection_attempt_delay` | Duration | `250ms` | Happy Eyeballs stagger (RFC 8305 §5), clamped to 100 ms – 2 s. |
 | `connections_max_idle` | `Option<Duration>` | `Some(9min)` | Idle-eviction window (Java `connections.max.idle.ms`). `None` disables eviction. |
 | `max_connections` | `Option<usize>` | `None` | Cap on live connections across all brokers, coordination connections included. Replacing a dead or session-expired connection never counts as growth; a connection beyond the cap fails with a retriable `Network` error, and a coordination connection falls back to the broker's data connection. |
-| `tls_reload_interval` | `Option<Duration>` | `None` | Re-read TLS certificate files from disk on a timer (KIP-1288). `kafka.refresh_tls()` reloads on demand. |
+| `tls_reload_interval` | `Option<Duration>` | `None` | Reload the TLS material on a timer (KIP-1288): files read again, a client identity provider called. `kafka.refresh_tls()` reloads on demand. |
 
 ```rust,compile
 use krafka::Kafka;

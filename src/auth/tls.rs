@@ -11,6 +11,7 @@
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::client::WantsClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -27,8 +28,11 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tracing::warn;
 
-use crate::auth::TlsConfig;
+use crate::auth::{
+    CaSource, ClientIdentitySource, TlsConfig, TlsIdentity, TlsIdentityProviderHandle,
+};
 use crate::error::{KrafkaError, Result};
+use crate::util::AbortOnDrop;
 
 // ---------------------------------------------------------------------------
 // Public async API — each function wraps the sync implementation in a single
@@ -37,8 +41,10 @@ use crate::error::{KrafkaError, Result};
 
 /// Build a rustls [`ClientConfig`] from [`TlsConfig`].
 ///
-/// All file I/O (certificates, keys, native root store) runs inside
-/// `spawn_blocking` so it never blocks the async runtime.
+/// A client identity provider is called first, in its own task and bounded
+/// by `provider_timeout`. Then all file I/O (certificates, keys, native root
+/// store), parsing and key decryption run inside `spawn_blocking` so they
+/// never block the runtime.
 ///
 /// When `verify_server_cert` is `false`, certificate verification is skipped
 /// entirely. This is useful for local development with self-signed certificates
@@ -48,14 +54,27 @@ use crate::error::{KrafkaError, Result};
 /// # Errors
 ///
 /// Returns an error if certificate/key files cannot be read or parsed.
-pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+pub async fn build_tls_config(
+    config: &TlsConfig,
+    provider_timeout: Duration,
+) -> Result<ClientConfig> {
+    let fetched = match &config.client_identity {
+        Some(ClientIdentitySource::Provider(provider)) => {
+            Some(fetch_identity(provider, provider_timeout).await?)
+        }
+        _ => None,
+    };
+    // Cheap: in-memory material is behind `Arc`, so no key bytes are copied.
     let config = config.clone();
-    tokio::task::spawn_blocking(move || build_tls_config_sync(&config))
-        .await
-        .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        client_config(resolve_crypto_provider(), &config, fetched.as_ref())
+    })
+    .await
+    .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
-/// Build a [`TlsConnector`] from [`TlsConfig`].
+/// Build a [`TlsConnector`] from [`TlsConfig`]; `provider_timeout` bounds a
+/// client identity provider call.
 ///
 /// Convenience wrapper around [`build_tls_config`] that produces a ready-to-use
 /// connector for [`connect_tls`].
@@ -63,9 +82,33 @@ pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
 /// # Errors
 ///
 /// Returns an error if certificate/key files cannot be read or parsed.
-pub async fn build_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
-    let client_config = build_tls_config(config).await?;
+pub async fn build_tls_connector(
+    config: &TlsConfig,
+    provider_timeout: Duration,
+) -> Result<TlsConnector> {
+    let client_config = build_tls_config(config, provider_timeout).await?;
     Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
+/// Call the client identity provider in its own task, bounded by `limit`.
+///
+/// A hung provider is a timeout and a panicking one an error, so neither
+/// stalls a client build nor ends the periodic reload task.
+async fn fetch_identity(
+    provider: &TlsIdentityProviderHandle,
+    limit: Duration,
+) -> Result<TlsIdentity> {
+    let provider = provider.clone();
+    let mut task = AbortOnDrop(tokio::spawn(
+        async move { provider.provide_identity().await },
+    ));
+    match tokio::time::timeout(limit, &mut task.0).await {
+        Ok(Ok(identity)) => identity,
+        Ok(Err(e)) => Err(KrafkaError::config(format!(
+            "client identity provider failed: {e}"
+        ))),
+        Err(_) => Err(KrafkaError::timeout("client identity provider")),
+    }
 }
 
 /// Connect with TLS using a pre-built connector.
@@ -120,16 +163,22 @@ fn handshake_error(error: std::io::Error) -> KrafkaError {
 
 /// Build a rustls [`ClientConfig`] synchronously.
 ///
-/// This is the core implementation. The public [`build_tls_config`] wraps this
-/// in `spawn_blocking`; the OIDC token endpoint's HTTPS client calls it
-/// directly, so both paths share one provider selection and one trust-store
-/// rule.
+/// The OIDC token endpoint's HTTPS client calls this; [`build_tls_config`]
+/// calls the same [`client_config`], so both paths share one provider
+/// selection and one trust-store rule. It cannot call a client identity
+/// provider; the OIDC builder sets none.
+#[cfg(any(feature = "oauth-oidc", test))]
 pub(crate) fn build_tls_config_sync(config: &TlsConfig) -> Result<ClientConfig> {
-    client_config(resolve_crypto_provider(), config)
+    client_config(resolve_crypto_provider(), config, None)
 }
 
-/// Build a [`ClientConfig`] on `provider`.
-fn client_config(provider: Arc<CryptoProvider>, config: &TlsConfig) -> Result<ClientConfig> {
+/// Build a [`ClientConfig`] on `provider`, with `fetched` the identity a
+/// client identity provider returned for this build.
+fn client_config(
+    provider: Arc<CryptoProvider>,
+    config: &TlsConfig,
+    fetched: Option<&TlsIdentity>,
+) -> Result<ClientConfig> {
     if !config.verify_server_cert {
         // Warn once so operators have log evidence that insecure TLS is active.
         // Setting verify_server_cert=false is itself the explicit opt-in; no
@@ -143,7 +192,7 @@ fn client_config(provider: Arc<CryptoProvider>, config: &TlsConfig) -> Result<Cl
                  with self-signed certificates. Never use in production."
             );
         });
-        return build_insecure_tls_config(provider, config);
+        return build_insecure_tls_config(provider, config, fetched);
     }
 
     let root_store = load_root_store(config)?;
@@ -159,7 +208,7 @@ fn client_config(provider: Arc<CryptoProvider>, config: &TlsConfig) -> Result<Cl
         .with_safe_default_protocol_versions()
         .map_err(|e| KrafkaError::config(format!("Failed to set protocol versions: {e}")))?
         .with_root_certificates(root_store);
-    let client_auth = load_client_auth(config)?;
+    let client_auth = load_client_auth(config, fetched)?;
     let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
     if !config.alpn_protocols.is_empty() {
@@ -173,7 +222,7 @@ fn client_config(provider: Arc<CryptoProvider>, config: &TlsConfig) -> Result<Cl
 /// waiting for a client‐auth decision, producing the final [`ClientConfig`].
 fn finish_with_client_auth(
     builder: ConfigBuilder<ClientConfig, WantsClientCert>,
-    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    client_auth: Option<ClientAuth>,
 ) -> Result<ClientConfig> {
     if let Some((certs, key)) = client_auth {
         builder
@@ -184,12 +233,77 @@ fn finish_with_client_auth(
     }
 }
 
+/// A piece of TLS material and where it came from, for error messages.
+///
+/// Messages name the item and its source, never the material: in-memory and
+/// provider-supplied input has no path, and its bytes may be a key.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    what: &'static str,
+    origin: Origin<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Origin<'a> {
+    File(&'a str),
+    Memory,
+    Provider,
+}
+
+impl<'a> Source<'a> {
+    fn file(what: &'static str, path: &'a str) -> Self {
+        Self {
+            what,
+            origin: Origin::File(path),
+        }
+    }
+
+    fn path(&self) -> Option<&'a str> {
+        match self.origin {
+            Origin::File(path) => Some(path),
+            Origin::Memory | Origin::Provider => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Source<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.origin {
+            Origin::File(path) => write!(f, "{} file {path}", self.what),
+            Origin::Memory => write!(f, "{} (in-memory PEM)", self.what),
+            Origin::Provider => write!(f, "{} (identity provider)", self.what),
+        }
+    }
+}
+
 /// Load certificates from a PEM file.
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_file_iter(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open cert file {path}: {e}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| KrafkaError::config(format!("Failed to parse cert file {path}: {e}")))
+fn load_certs(what: &'static str, path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let source = Source::file(what, path);
+    let certs = CertificateDer::pem_file_iter(Path::new(path))
+        .map_err(|e| KrafkaError::config(format!("Failed to open {source}: {e}")))?
+        .collect();
+    non_empty_certs(certs, source)
+}
+
+/// Parse certificates from in-memory PEM.
+fn parse_certs(pem: &[u8], source: Source<'_>) -> Result<Vec<CertificateDer<'static>>> {
+    non_empty_certs(CertificateDer::pem_slice_iter(pem).collect(), source)
+}
+
+/// An input with no `CERTIFICATE` section is an error here, not later: an
+/// empty CA bundle would otherwise build an empty trust store, and every
+/// handshake would fail naming neither the setting nor the source.
+fn non_empty_certs(
+    certs: std::result::Result<Vec<CertificateDer<'static>>, rustls::pki_types::pem::Error>,
+    source: Source<'_>,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let certs = certs.map_err(|e| KrafkaError::config(format!("Failed to parse {source}: {e}")))?;
+    if certs.is_empty() {
+        return Err(KrafkaError::config(format!(
+            "no certificates found in {source}"
+        )));
+    }
+    Ok(certs)
 }
 
 /// Load a private key from a PEM file.
@@ -201,15 +315,12 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 ///
 /// On Unix, warns if the file is group- or world-accessible
 /// (permissions `& 0o077 != 0`).
-///
-/// An `ENCRYPTED PRIVATE KEY` section is decrypted with `password` (see
-/// [`decrypt_pkcs8_key`]). Legacy OpenSSL encryption is rejected with the
-/// command that converts it, rather than surfacing as a parse failure.
 fn load_private_key(path: &str, password: Option<&str>) -> Result<PrivateKeyDer<'static>> {
     use std::io::Read as _;
 
+    let source = Source::file("client key", path);
     let mut file = File::open(Path::new(path))
-        .map_err(|e| KrafkaError::config(format!("Failed to open key file {path}: {e}")))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to open {source}: {e}")))?;
 
     // Warn on overly permissive file permissions. Unix-only: Windows uses ACLs,
     // which have no meaningful equivalent to a mode bitmask.
@@ -228,27 +339,46 @@ fn load_private_key(path: &str, password: Option<&str>) -> Result<PrivateKeyDer<
     }
 
     // Zeroized on drop: the PEM text holds the private key in cleartext, and
-    // the parsed `PrivateKeyDer` does not take ownership of this buffer.
-    let mut pem = zeroize::Zeroizing::new(Vec::new());
+    // the parsed `PrivateKeyDer` does not take ownership of this buffer. Sized
+    // from the file so `read_to_end` never reallocates, which would free a
+    // partial copy unzeroized.
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut pem = zeroize::Zeroizing::new(Vec::with_capacity(
+        usize::try_from(len).unwrap_or(0).saturating_add(1),
+    ));
     file.read_to_end(&mut pem)
-        .map_err(|e| KrafkaError::config(format!("Failed to read key file {path}: {e}")))?;
+        .map_err(|e| KrafkaError::config(format!("Failed to read {source}: {e}")))?;
 
+    parse_private_key(&pem, source, password)
+}
+
+/// Parse a private key from PEM, whatever its source.
+///
+/// An `ENCRYPTED PRIVATE KEY` section is decrypted with `password` (see
+/// [`decrypt_pkcs8_key`]). Legacy OpenSSL encryption is rejected with the
+/// command that converts it, rather than surfacing as a parse failure.
+fn parse_private_key(
+    pem: &[u8],
+    source: Source<'_>,
+    password: Option<&str>,
+) -> Result<PrivateKeyDer<'static>> {
     // Checked first: the legacy format keeps an ordinary `… PRIVATE KEY`
     // label, so the parser below would fail on its headers instead.
-    if contains(&pem, LEGACY_ENCRYPTED_HEADER) {
+    if contains(pem, LEGACY_ENCRYPTED_HEADER) {
+        let input = source.path().unwrap_or("<key-file>");
         return Err(KrafkaError::config(format!(
-            "Private key file {path} uses legacy OpenSSL encryption (Proc-Type: 4,ENCRYPTED), \
+            "{source} uses legacy OpenSSL encryption (Proc-Type: 4,ENCRYPTED), \
              which is not supported; convert it to encrypted PKCS#8 with \
-             `openssl pkcs8 -topk8 -v2 aes256 -in {path} -out <new-key-file>`"
+             `openssl pkcs8 -topk8 -v2 aes256 -in {input} -out <new-key-file>`"
         )));
     }
 
-    if contains(&pem, ENCRYPTED_PKCS8_BEGIN) {
-        return decrypt_pkcs8_key(path, &pem, password);
+    if contains(pem, ENCRYPTED_PKCS8_BEGIN) {
+        return decrypt_pkcs8_key(source, pem, password);
     }
 
-    PrivateKeyDer::from_pem_slice(&pem)
-        .map_err(|e| KrafkaError::config(format!("Failed to parse private key file {path}: {e}")))
+    PrivateKeyDer::from_pem_slice(pem)
+        .map_err(|e| KrafkaError::config(format!("Failed to parse {source}: {e}")))
 }
 
 /// PEM boundaries of a PKCS#8 `EncryptedPrivateKeyInfo` (RFC 7468 §11).
@@ -274,7 +404,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// conversion command instead.
 #[cfg(feature = "tls-encrypted-keys")]
 fn decrypt_pkcs8_key(
-    path: &str,
+    source: Source<'_>,
     pem: &[u8],
     password: Option<&str>,
 ) -> Result<PrivateKeyDer<'static>> {
@@ -284,14 +414,15 @@ fn decrypt_pkcs8_key(
 
     let password = password.ok_or_else(|| {
         KrafkaError::config(format!(
-            "Private key file {path} is encrypted; set its passphrase with \
-             TlsConfig::with_client_key_password or KAFKA_SSL_KEY_PASSWORD"
+            "{source} is encrypted; set its passphrase with \
+             TlsConfig::with_client_key_password, TlsIdentity::with_key_password \
+             or KAFKA_SSL_KEY_PASSWORD"
         ))
     })?;
 
     let malformed = || {
         KrafkaError::config(format!(
-            "Failed to parse private key file {path}: malformed ENCRYPTED PRIVATE KEY section"
+            "Failed to parse {source}: malformed ENCRYPTED PRIVATE KEY section"
         ))
     };
     let start = find(pem, ENCRYPTED_PKCS8_BEGIN).ok_or_else(malformed)?;
@@ -300,18 +431,16 @@ fn decrypt_pkcs8_key(
         .ok_or_else(malformed)?;
     let section = std::str::from_utf8(&pem[start..end]).map_err(|_| malformed())?;
 
-    let (_, document) = Document::from_pem(section).map_err(|e| {
-        KrafkaError::config(format!("Failed to parse private key file {path}: {e}"))
-    })?;
-    let info = EncryptedPrivateKeyInfo::try_from(document.as_bytes()).map_err(|e| {
-        KrafkaError::config(format!("Failed to parse private key file {path}: {e}"))
-    })?;
+    let (_, document) = Document::from_pem(section)
+        .map_err(|e| KrafkaError::config(format!("Failed to parse {source}: {e}")))?;
+    let info = EncryptedPrivateKeyInfo::try_from(document.as_bytes())
+        .map_err(|e| KrafkaError::config(format!("Failed to parse {source}: {e}")))?;
 
     // A wrong passphrase and an unsupported scheme are indistinguishable to
     // the caller fixing it, so the message covers both.
     let decrypted = info.decrypt(password).map_err(|e| {
         KrafkaError::config(format!(
-            "Failed to decrypt private key file {path} ({e}): check the passphrase; \
+            "Failed to decrypt {source} ({e}): check the passphrase; \
              supported encryption is PKCS#8 PBES2 (PBKDF2 with HMAC-SHA-2, or scrypt) \
              with AES-CBC — re-encrypt other keys with `openssl pkcs8 -topk8 -v2 aes256`"
         ))
@@ -328,12 +457,12 @@ fn decrypt_pkcs8_key(
 
 #[cfg(not(feature = "tls-encrypted-keys"))]
 fn decrypt_pkcs8_key(
-    path: &str,
+    source: Source<'_>,
     _pem: &[u8],
     _password: Option<&str>,
 ) -> Result<PrivateKeyDer<'static>> {
     Err(KrafkaError::config(format!(
-        "Private key file {path} is encrypted; decrypting it requires the \
+        "{source} is encrypted; decrypting it requires the \
          'tls-encrypted-keys' crate feature"
     )))
 }
@@ -349,6 +478,8 @@ fn decrypt_pkcs8_key(
 /// | `with_native_roots()` only            | Platform roots only                     |
 /// | `with_native_roots()` + `with_ca_cert()` | Platform roots + CA certs (additive) |
 ///
+/// `with_ca_cert_pem()` follows the same rule as `with_ca_cert()`.
+///
 /// Pinning is the industry-standard behaviour for TLS clients (Java Kafka
 /// client, librdkafka, Go `tls.Config`): when the caller explicitly provides
 /// a CA, only that CA is trusted — default/native roots are **not** loaded
@@ -356,16 +487,26 @@ fn decrypt_pkcs8_key(
 fn load_root_store(config: &TlsConfig) -> Result<RootCertStore> {
     let mut root_store = RootCertStore::empty();
 
-    if let Some(ca_path) = &config.ca_cert_path {
+    if let Some(ca) = &config.ca_cert {
         // When native roots are also requested, load them first so the
         // explicit CA certs are added on top (additive mode).
         if config.use_native_roots {
             load_default_roots(&mut root_store, config)?;
         }
 
+        let certs = match ca {
+            CaSource::Path(path) => load_certs("CA bundle", path)?,
+            CaSource::Pem(pem) => parse_certs(
+                pem,
+                Source {
+                    what: "CA bundle",
+                    origin: Origin::Memory,
+                },
+            )?,
+        };
         // Pinning: only the provided CA bundle is trusted (unless
         // `use_native_roots` was set above).
-        for cert in load_certs(ca_path)? {
+        for cert in certs {
             root_store
                 .add(cert)
                 .map_err(|e| KrafkaError::config(format!("Failed to add CA cert: {e}")))?;
@@ -414,26 +555,72 @@ fn load_default_roots(root_store: &mut RootCertStore, config: &TlsConfig) -> Res
     Ok(())
 }
 
+type ClientAuth = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
+
 /// Load client certificate + private key, if configured.
+///
+/// `fetched` is what the client identity provider returned for this build;
+/// it is `None` unless the identity source is a provider.
 ///
 /// A key passphrase with no key to decrypt is an error rather than ignored:
 /// it means the client certificate was meant to be configured and is not.
 fn load_client_auth(
     config: &TlsConfig,
-) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
-    if let (Some(cert_path), Some(key_path)) = (&config.client_cert_path, &config.client_key_path) {
-        let certs = load_certs(cert_path)?;
-        let password = config.client_key_password.as_deref().map(String::as_str);
-        let key = load_private_key(key_path, password)?;
-        Ok(Some((certs, key)))
-    } else if config.client_key_password.is_some() {
-        Err(KrafkaError::config(
+    fetched: Option<&TlsIdentity>,
+) -> Result<Option<ClientAuth>> {
+    let password = config.client_key_password.as_deref().map(String::as_str);
+    match &config.client_identity {
+        Some(ClientIdentitySource::Files {
+            cert_path,
+            key_path,
+        }) => {
+            let certs = load_certs("client certificate", cert_path)?;
+            let key = load_private_key(key_path, password)?;
+            Ok(Some((certs, key)))
+        }
+        Some(ClientIdentitySource::Pem(identity)) => {
+            parse_identity(identity, Origin::Memory, password).map(Some)
+        }
+        Some(ClientIdentitySource::Provider(_)) => {
+            let identity = fetched.ok_or_else(|| {
+                KrafkaError::config(
+                    "a client identity provider is configured on a TLS config built \
+                     synchronously; it is only called when a Kafka client is built",
+                )
+            })?;
+            parse_identity(identity, Origin::Provider, password).map(Some)
+        }
+        None if config.client_key_password.is_some() => Err(KrafkaError::config(
             "a client key passphrase (with_client_key_password) is set but no client key \
-             is configured; set the certificate and key with TlsConfig::with_client_cert",
-        ))
-    } else {
-        Ok(None)
+             is configured; set the certificate and key with TlsConfig::with_client_cert, \
+             with_client_cert_pem or with_client_identity_provider",
+        )),
+        None => Ok(None),
     }
+}
+
+/// Parse an in-memory identity; its own passphrase wins over `fallback`.
+fn parse_identity(
+    identity: &TlsIdentity,
+    origin: Origin<'_>,
+    fallback: Option<&str>,
+) -> Result<ClientAuth> {
+    let certs = parse_certs(
+        identity.cert_chain_pem(),
+        Source {
+            what: "client certificate",
+            origin,
+        },
+    )?;
+    let key = parse_private_key(
+        identity.private_key_pem(),
+        Source {
+            what: "client key",
+            origin,
+        },
+        identity.key_password().or(fallback),
+    )?;
+    Ok((certs, key))
 }
 
 /// Resolve the crypto provider: prefer the globally-installed default,
@@ -484,9 +671,10 @@ fn insecure_builder(
 fn build_insecure_tls_config(
     provider: Arc<CryptoProvider>,
     config: &TlsConfig,
+    fetched: Option<&TlsIdentity>,
 ) -> Result<ClientConfig> {
     let builder = insecure_builder(provider)?;
-    let client_auth = load_client_auth(config)?;
+    let client_auth = load_client_auth(config, fetched)?;
     let mut tls_config = finish_with_client_auth(builder, client_auth)?;
 
     if !config.alpn_protocols.is_empty() {
@@ -637,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_load_certs_nonexistent() {
-        let result = load_certs("/nonexistent/path/cert.pem");
+        let result = load_certs("CA bundle", "/nonexistent/path/cert.pem");
         assert!(result.is_err());
     }
 
@@ -814,6 +1002,204 @@ mod tests {
         }
     }
 
+    // ── in-memory and provider-supplied material ─────────────────────────
+
+    use super::test_support::{presented_by, testdata_bytes};
+    use crate::auth::TlsIdentity;
+
+    fn first_cert(name: &str) -> CertificateDer<'static> {
+        parse_certs(
+            &testdata_bytes(name),
+            Source {
+                what: "certificate",
+                origin: Origin::Memory,
+            },
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    fn key_body_lines(name: &str) -> Vec<String> {
+        String::from_utf8(testdata_bytes(name))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("-----") && !l.contains(':') && !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn pem_auth_config(key: &str, password: Option<&str>) -> TlsConfig {
+        let mut config = TlsConfig::new()
+            .with_client_cert_pem(testdata_bytes("client.pem"), testdata_bytes(key));
+        config.client_key_password = password.map(|p| zeroize::Zeroizing::new(p.to_string()));
+        config
+    }
+
+    #[tokio::test]
+    async fn mtls_from_in_memory_pem_presents_the_client_certificate() {
+        setup_crypto_provider();
+        let config = TlsConfig::new()
+            .with_ca_cert_pem(testdata_bytes("ca.pem"))
+            .with_client_cert_pem(testdata_bytes("client.pem"), testdata_bytes("client.key"));
+        assert_eq!(config.ca_cert_path(), None);
+        assert_eq!(config.client_cert_path(), None);
+        assert_eq!(config.client_key_path(), None);
+
+        let connector = build_tls_connector(&config, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let seen = presented_by(&connector).await.expect("handshake");
+        assert_eq!(seen, Some(first_cert("client.pem")));
+    }
+
+    /// Every key the file path accepts or rejects, memory accepts or
+    /// rejects the same way; a memory error names its source and carries
+    /// neither a path nor the key.
+    #[test]
+    fn a_key_from_memory_loads_like_the_same_file() {
+        setup_crypto_provider();
+        let mut cases: Vec<(&str, Option<&str>)> = vec![
+            ("client.key", None),
+            ("client.key", Some("krafka-test")),
+            ("client-legacy.key", Some("krafka-test")),
+            ("client-pbes2.key", None),
+            ("client-pbes2.key", Some("krafka-test")),
+            ("client-scrypt.key", Some("krafka-test")),
+            ("client-pbes2-sha1.key", Some("krafka-test")),
+        ];
+        if cfg!(feature = "tls-encrypted-keys") {
+            cases.push(("client-pbes2.key", Some("wrong")));
+        }
+        for (key, password) in cases {
+            let from_file = build_tls_config_sync(&client_auth_config(key, password));
+            let from_memory = build_tls_config_sync(&pem_auth_config(key, password));
+            assert_eq!(
+                from_file.is_ok(),
+                from_memory.is_ok(),
+                "{key} {password:?}: file {from_file:?}, memory {from_memory:?}"
+            );
+            if let Err(e) = from_memory {
+                let err = e.to_string();
+                assert!(err.contains("client key (in-memory PEM)"), "got: {err}");
+                assert!(!err.contains("testdata"), "a path in: {err}");
+                for line in key_body_lines(key) {
+                    assert!(!err.contains(&line), "key material in: {err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_encrypted_key_in_memory_names_the_conversion_without_a_path() {
+        setup_crypto_provider();
+        let err = build_tls_config_sync(&pem_auth_config("client-legacy.key", None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Proc-Type"), "got: {err}");
+        assert!(err.contains("-in <key-file>"), "got: {err}");
+    }
+
+    #[test]
+    fn material_with_no_certificate_is_rejected_at_build() {
+        setup_crypto_provider();
+        let dir = std::env::temp_dir().join(format!("krafka-tls-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+
+        let configs = [
+            TlsConfig::new().with_ca_cert_pem(Vec::new()),
+            TlsConfig::new().with_ca_cert_pem(testdata_bytes("client.key")),
+            TlsConfig::new().with_ca_cert(empty.to_str().unwrap()),
+            TlsConfig::new().with_client_cert_pem(Vec::new(), testdata_bytes("client.key")),
+        ];
+        let errors: Vec<String> = configs
+            .iter()
+            .map(|c| build_tls_config_sync(c).unwrap_err().to_string())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for err in errors {
+            assert!(err.contains("no certificates found in"), "got: {err}");
+        }
+    }
+
+    /// Pinning: the bundle is the whole trust store, with no default roots
+    /// added, whatever its size.
+    #[test]
+    fn an_in_memory_ca_bundle_is_the_whole_trust_store() {
+        let mut two = testdata_bytes("ca.pem");
+        two.extend(testdata_bytes("client.pem"));
+        for (pem, certs) in [(testdata_bytes("ca.pem"), 1), (two, 2)] {
+            let store = load_root_store(&TlsConfig::new().with_ca_cert_pem(pem)).unwrap();
+            assert_eq!(store.len(), certs);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_ca_pins() {
+        setup_crypto_provider();
+        // `client.pem` is a CA, but not the one that issued `server.pem`.
+        let config = TlsConfig::new().with_ca_cert_pem(testdata_bytes("client.pem"));
+        let connector = build_tls_connector(&config, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(presented_by(&connector).await.is_err());
+    }
+
+    #[test]
+    fn a_provider_identity_is_parsed_and_named_as_such() {
+        setup_crypto_provider();
+        let config = TlsConfig::new()
+            .with_client_identity_provider(|| async { Ok(TlsIdentity::from_pem("", Vec::new())) });
+        let good =
+            TlsIdentity::from_pem(testdata_bytes("client.pem"), testdata_bytes("client.key"));
+        client_config(resolve_crypto_provider(), &config, Some(&good)).unwrap();
+
+        let bad = TlsIdentity::from_pem(testdata_bytes("client.pem"), b"not a key".to_vec());
+        let err = client_config(resolve_crypto_provider(), &config, Some(&bad))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client key (identity provider)"), "got: {err}");
+
+        // Only a synchronous build can reach a provider without fetching it.
+        let err = build_tls_config_sync(&config).unwrap_err().to_string();
+        assert!(err.contains("identity provider"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "tls-encrypted-keys")]
+    fn an_identity_passphrase_wins_over_the_config_one() {
+        setup_crypto_provider();
+        let identity = |password: Option<&str>| {
+            let id = TlsIdentity::from_pem(
+                testdata_bytes("client.pem"),
+                testdata_bytes("client-pbes2.key"),
+            );
+            match password {
+                Some(p) => id.with_key_password(p),
+                None => id,
+            }
+        };
+        let config = |password: &str| {
+            TlsConfig::new()
+                .with_client_identity_provider(|| async {
+                    Ok(TlsIdentity::from_pem("", Vec::new()))
+                })
+                .with_client_key_password(password)
+        };
+        let build = |config: &TlsConfig, id: &TlsIdentity| {
+            client_config(resolve_crypto_provider(), config, Some(id))
+        };
+
+        build(&config("wrong"), &identity(Some("krafka-test")))
+            .expect("the identity's own passphrase");
+        build(&config("krafka-test"), &identity(None))
+            .expect("the config's passphrase as fallback");
+        build(&config("krafka-test"), &identity(Some("wrong")))
+            .expect_err("the identity's passphrase is used, not the config's");
+    }
+
     // ── key exchange ─────────────────────────────────────────────────────
 
     #[cfg(feature = "rustls-aws-lc-rs")]
@@ -860,7 +1246,7 @@ mod tests {
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(
-                load_certs(&testdata("server.pem")).unwrap(),
+                load_certs("certificate", &testdata("server.pem")).unwrap(),
                 load_private_key(&testdata("server.key"), None).unwrap(),
             )
             .unwrap()
@@ -936,7 +1322,7 @@ mod tests {
             );
             let result = handshake(
                 server_offering(vec![kx_group::X25519MLKEM768]),
-                client_config(ring, &trusting_test_ca()).unwrap(),
+                client_config(ring, &trusting_test_ca(), None).unwrap(),
             )
             .await;
             assert!(result.is_err(), "ring negotiated {result:?}");
@@ -952,5 +1338,125 @@ mod tests {
                 .iter()
                 .all(|g| g.name() != rustls::NamedGroup::X25519MLKEM768)
         );
+    }
+}
+
+/// A loopback mTLS server for tests here and in the connection layer.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+pub(crate) mod test_support {
+    use super::*;
+    use rustls::DistinguishedName;
+    use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+
+    pub(crate) fn testdata_bytes(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/src/auth/testdata/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    /// Asks for a client certificate and accepts any whose handshake
+    /// signature verifies: the tests assert which certificate arrived, not
+    /// chain building, and `client.pem` (self-signed, `CA:TRUE`) is not a
+    /// valid end entity under WebPKI rules.
+    #[derive(Debug)]
+    struct AnyClientCert(Arc<CryptoProvider>);
+
+    impl ClientCertVerifier for AnyClientCert {
+        fn client_auth_mandatory(&self) -> bool {
+            false
+        }
+
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _now: UnixTime,
+        ) -> std::result::Result<ClientCertVerified, RustlsError> {
+            Ok(ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Handshake with a one-shot server holding `server.pem` (issued by
+    /// `ca.pem`, valid for 127.0.0.1) and return the client certificate the
+    /// server received, if any.
+    pub(crate) async fn presented_by(
+        connector: &TlsConnector,
+    ) -> Result<Option<CertificateDer<'static>>> {
+        let provider = resolve_crypto_provider();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(AnyClientCert(provider)))
+            .with_single_cert(
+                parse_certs(
+                    &testdata_bytes("server.pem"),
+                    Source {
+                        what: "certificate",
+                        origin: Origin::Memory,
+                    },
+                )
+                .unwrap(),
+                PrivateKeyDer::from_pem_slice(&testdata_bytes("server.key")).unwrap(),
+            )
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.ok()?;
+            Some(
+                tls.get_ref()
+                    .1
+                    .peer_certificates()
+                    .map(|chain| chain[0].clone().into_owned()),
+            )
+        });
+
+        let tcp = TcpStream::connect(&addr).await.unwrap();
+        let client = connect_tls(tcp, &addr, None, connector).await;
+        let seen = server.await.unwrap();
+        client?;
+        Ok(seen.flatten())
     }
 }

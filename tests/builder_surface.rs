@@ -403,3 +403,44 @@ fn every_sasl_mechanism_is_reachable_over_both_transports() {
         &SecurityProtocol::Ssl
     );
 }
+
+/// TLS material from memory and from a provider is settable from the public
+/// API alone and reaches the one connection builder.
+#[test]
+fn tls_material_is_settable_from_memory_and_from_a_provider() {
+    use krafka::auth::{AuthConfig, SecurityProtocol, TlsConfig, TlsIdentity};
+
+    let from_memory = TlsConfig::new()
+        .with_ca_cert_pem("-----BEGIN CERTIFICATE-----")
+        .with_client_cert_pem("-----BEGIN CERTIFICATE-----", b"key".to_vec());
+    let from_provider = TlsConfig::new().with_client_identity_provider(|| async {
+        Ok(TlsIdentity::from_pem("cert", b"key".to_vec()))
+    });
+
+    for tls in [from_memory, from_provider] {
+        assert_eq!(tls.ca_cert_path(), None);
+        assert_eq!(tls.client_cert_path(), None);
+        assert_eq!(tls.client_key_path(), None);
+        let auth = AuthConfig::ssl(tls);
+        assert_eq!(auth.security_protocol(), &SecurityProtocol::Ssl);
+        let _ = krafka::Kafka::builder("localhost:9093").security(auth);
+    }
+
+    #[cfg(feature = "tls-encrypted-keys")]
+    let _ = TlsIdentity::from_pem("cert", b"key".to_vec()).with_key_password("passphrase");
+
+    #[cfg(feature = "oauth-oidc")]
+    let _ = krafka::auth::OidcTokenProvider::builder("https://idp.example.com/token")
+        .ca_cert_pem("-----BEGIN CERTIFICATE-----");
+}
+
+/// Removing an auto trait from a public type is a semver break; these must
+/// hold whatever TLS source is configured.
+#[test]
+fn tls_types_keep_their_auto_traits() {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+
+    fn auto_traits<T: Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+    auto_traits::<krafka::auth::TlsConfig>();
+    auto_traits::<krafka::auth::TlsIdentity>();
+}

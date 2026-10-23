@@ -54,6 +54,8 @@ fn evidence() {
     { use krafka::admin::FeatureMetadata as _; }
     // KIP-584
     { use krafka::admin::UpdateFeaturesOptions as _; }
+    // KIP-651
+    { use krafka::auth::TlsIdentity as _; }
     // KIP-664
     { use krafka::admin::ProducerState as _; }
     // KIP-664

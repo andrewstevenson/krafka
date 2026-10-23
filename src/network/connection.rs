@@ -269,13 +269,16 @@ pub struct ConnectionConfig {
     /// Cached TLS connector built from [`AuthConfig::tls_config`].
     ///
     /// Populated by [`init_tls()`](ConnectionConfig::init_tls). When present,
-    /// connections reuse this connector instead of reading certificate files
-    /// from disk on every connection attempt.
+    /// connections reuse this connector instead of building one from the TLS
+    /// material on every connection attempt.
     ///
     /// Wrapped in `Arc<ArcSwap<…>>` so that all clones of this config share
     /// the same connector and [`refresh_tls()`](ConnectionConfig::refresh_tls)
     /// atomically updates it for every future connection.
     pub(crate) tls_connector: Arc<ArcSwap<Option<TlsConnector>>>,
+    /// Serialises TLS reloads across clones, so a slow reload cannot store
+    /// its older material over a newer one.
+    pub(crate) tls_reload: Arc<tokio::sync::Mutex<()>>,
     /// TCP keepalive interval.
     ///
     /// When set, enables TCP keepalive on all broker connections with the
@@ -357,50 +360,53 @@ impl ConnectionConfig {
 
     /// Pre-build and cache the TLS connector from the configured certificates.
     ///
-    /// When TLS is configured, this reads the certificate and key files once
-    /// (via `spawn_blocking`) and stores the resulting [`TlsConnector`] for
-    /// reuse across all connections and reconnections. Without this call,
-    /// every connection attempt re-reads the files from disk.
+    /// When TLS is configured, this loads the TLS material once — calling a
+    /// client identity provider (bounded by `request_timeout`), then reading
+    /// and parsing in `spawn_blocking` — and stores the resulting
+    /// [`TlsConnector`] for reuse across all connections and reconnections.
+    /// Without this call, every connection attempt builds its own connector.
     ///
     /// This is a no-op when no TLS configuration is present.
     ///
     /// # Errors
     ///
-    /// Returns an error if certificate or key files cannot be read or parsed.
+    /// Returns an error if the TLS material cannot be read, fetched or parsed.
     pub async fn init_tls(&mut self) -> Result<()> {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let connector = build_tls_connector(tls_config).await?;
+            let connector = build_tls_connector(tls_config, self.request_timeout).await?;
             self.tls_connector.store(Arc::new(Some(connector)));
         }
         Ok(())
     }
 
-    /// Re-read certificate files from disk and atomically replace the cached
-    /// TLS connector.
+    /// Reload the TLS material and atomically replace the cached TLS
+    /// connector: files are read again, in-memory PEM is parsed again, and a
+    /// client identity provider is called once.
     ///
     /// All future connections (including reconnections from the pool) will use
     /// the new certificates. Existing TLS sessions are unaffected — they
     /// continue using the connector that was active at handshake time.
     ///
-    /// Call this after rotating certificates on disk, or on a periodic timer
-    /// (e.g. once per hour) to pick up renewed certificates without a client
+    /// Call this after rotating certificates, or on a periodic timer (e.g.
+    /// once per hour) to pick up renewed certificates without a client
     /// restart.
     ///
     /// This is a no-op when no TLS configuration is present.
     ///
     /// # Errors
     ///
-    /// Returns an error if the new certificate or key files cannot be read or
+    /// Returns an error if the new material cannot be read, fetched or
     /// parsed. The existing (old) connector remains active on failure.
     pub async fn refresh_tls(&self) -> Result<()> {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let connector = build_tls_connector(tls_config).await?;
+            let _reload = self.tls_reload.lock().await;
+            let connector = build_tls_connector(tls_config, self.request_timeout).await?;
             self.tls_connector.store(Arc::new(Some(connector)));
-            info!("TLS connector refreshed from disk");
+            info!("TLS connector refreshed");
         }
         Ok(())
     }
@@ -502,6 +508,7 @@ impl Default for ConnectionConfigBuilder {
             max_in_flight_requests: 10,
             auth: None,
             tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
+            tls_reload: Arc::new(tokio::sync::Mutex::new(())),
             tcp_keepalive: Some(Duration::from_secs(60)),
             connection_attempt_delay: Duration::from_millis(250),
             msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
@@ -1033,11 +1040,12 @@ impl BrokerConnection {
                 .ok_or_else(|| KrafkaError::config("TLS required but no TLS config provided"))?;
 
             // Use cached TLS connector or build one from config. Calling
-            // `init_tls()` before first use avoids this fallback and the
-            // repeated disk I/O it entails.
+            // `init_tls()` before first use (every client build does) avoids
+            // this fallback, which reloads the material — and calls a client
+            // identity provider — per connection.
             let connector = match &**config.tls_connector.load() {
                 Some(c) => c.clone(),
-                None => build_tls_connector(tls_config).await?,
+                None => build_tls_connector(tls_config, config.request_timeout).await?,
             };
 
             // Extract hostname (without port) for TLS SNI.
@@ -4701,5 +4709,197 @@ mod tests {
     fn test_the_default_connect_timeout_constant_is_what_the_builder_uses() {
         let config = ConnectionConfig::default();
         assert_eq!(config.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    // ── TLS identity provider ────────────────────────────────────────────
+
+    /// The connector a new connection would use now.
+    fn current_tls_connector(config: &ConnectionConfig) -> Arc<Option<TlsConnector>> {
+        config.tls_connector.load_full()
+    }
+
+    fn identity(name: &str) -> crate::auth::TlsIdentity {
+        use crate::auth::tls::test_support::testdata_bytes;
+        crate::auth::TlsIdentity::from_pem(
+            testdata_bytes(&format!("{name}.pem")),
+            testdata_bytes(&format!("{name}.key")),
+        )
+    }
+
+    /// `names[n]` on the n-th call; an error once they run out.
+    fn rotating_tls(
+        names: &'static [&'static str],
+    ) -> (crate::auth::TlsConfig, Arc<std::sync::atomic::AtomicUsize>) {
+        use crate::auth::tls::test_support::testdata_bytes;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let tls = crate::auth::TlsConfig::new()
+            .with_ca_cert_pem(testdata_bytes("ca.pem"))
+            .with_client_identity_provider(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    names
+                        .get(n)
+                        .map(|name| identity(name))
+                        .ok_or_else(|| KrafkaError::config("identity source unavailable"))
+                }
+            });
+        (tls, calls)
+    }
+
+    async fn presented_cert(config: &ConnectionConfig) -> Vec<u8> {
+        let connector = current_tls_connector(config);
+        let connector = connector.as_ref().as_ref().expect("a TLS connector");
+        crate::auth::tls::test_support::presented_by(connector)
+            .await
+            .expect("handshake")
+            .expect("a client certificate")
+            .to_vec()
+    }
+
+    fn cert_der(name: &str) -> Vec<u8> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject as _;
+        let pem = crate::auth::tls::test_support::testdata_bytes(&format!("{name}.pem"));
+        CertificateDer::from_pem_slice(&pem).unwrap().to_vec()
+    }
+
+    #[tokio::test]
+    async fn tls_identity_provider_is_fetched_at_init_and_on_each_refresh() {
+        let (tls, calls) = rotating_tls(&["client", "client-b"]);
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+
+        config.init_tls().await.unwrap();
+        assert_eq!(presented_cert(&config).await, cert_der("client"));
+        // Connections do not call the provider.
+        assert_eq!(presented_cert(&config).await, cert_der("client"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        config.refresh_tls().await.unwrap();
+        assert_eq!(presented_cert(&config).await, cert_der("client-b"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_identity_fetch_keeps_the_active_connector() {
+        let (tls, _) = rotating_tls(&["client"]);
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        config.init_tls().await.unwrap();
+        let before = current_tls_connector(&config);
+
+        let err = config.refresh_tls().await.unwrap_err();
+        assert!(
+            err.to_string().contains("identity source unavailable"),
+            "got: {err}"
+        );
+        assert!(Arc::ptr_eq(&before, &current_tls_connector(&config)));
+        assert_eq!(presented_cert(&config).await, cert_der("client"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_identity_fetch_at_init_fails_init() {
+        let (tls, _) = rotating_tls(&[]);
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        let err = config.init_tls().await.unwrap_err();
+        assert!(
+            err.to_string().contains("identity source unavailable"),
+            "got: {err}"
+        );
+        assert!(current_tls_connector(&config).is_none());
+    }
+
+    /// Real connections use the connector cached at init; none calls the
+    /// provider again.
+    #[tokio::test]
+    async fn connections_reuse_the_identity_fetched_at_init() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                drop(tcp);
+            }
+        });
+
+        let (tls, calls) = rotating_tls(&["client", "client-b", "client-b"]);
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        config.init_tls().await.unwrap();
+        for _ in 0..2 {
+            // The listener drops the socket, so the handshake fails; the
+            // connector was chosen before that.
+            let _ = BrokerConnection::connect(&addr, config.clone()).await;
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_identity_provider_times_out() {
+        let tls = crate::auth::TlsConfig::new().with_client_identity_provider(|| async {
+            std::future::pending::<crate::Result<crate::auth::TlsIdentity>>().await
+        });
+        let mut config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .request_timeout(Duration::from_millis(100))
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), config.init_tls())
+            .await
+            .expect("bounded by request_timeout")
+            .unwrap_err();
+        assert!(matches!(err, KrafkaError::Timeout { .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_identity_provider_is_an_error() {
+        let tls = crate::auth::TlsConfig::new()
+            .with_client_identity_provider(|| async { panic!("provider bug") });
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        let err = config.init_tls().await.unwrap_err();
+        assert!(err.to_string().contains("panicked"), "got: {err}");
+    }
+
+    /// A slow reload that started first must not store its older identity
+    /// over a newer one stored meanwhile.
+    #[tokio::test]
+    async fn concurrent_reloads_keep_the_newest_identity() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let tls = crate::auth::TlsConfig::new()
+            .with_ca_cert_pem(crate::auth::tls::test_support::testdata_bytes("ca.pem"))
+            .with_client_identity_provider(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n == 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Ok(identity(if n == 2 { "client-b" } else { "client" }))
+                }
+            });
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        config.init_tls().await.unwrap();
+
+        let (slow, fast) = tokio::join!(config.refresh_tls(), config.refresh_tls());
+        slow.unwrap();
+        fast.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(presented_cert(&config).await, cert_der("client-b"));
     }
 }

@@ -13,6 +13,31 @@ not a complete record.
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-10-23
+
+### Added
+
+- **TLS material from memory**: `TlsConfig::with_ca_cert_pem()` and
+  `with_client_cert_pem()` (librdkafka's `ssl.*.pem`, the Java client's
+  KIP-651 settings), and `OidcTokenProviderBuilder::ca_cert_pem()`. The key is
+  zeroized on drop; encrypted keys decrypt with `with_client_key_password()`.
+- **A rotating client identity**: `TlsConfig::with_client_identity_provider()`
+  takes a `CredentialProvider<TlsIdentity>`, called at client build and on each
+  `refresh_tls()` / `tls_reload_interval` reload, bounded by `request_timeout`.
+
+### Changed
+
+- `ca_cert_path()`, `client_cert_path()` and `client_key_path()` return `None`
+  when that material is set from memory or a provider.
+
+### Fixed
+
+- A CA bundle or client certificate with no `CERTIFICATE` section fails when the
+  client is built, naming the setting, instead of failing every handshake.
+- Require `rustls` 0.23.46, `tokio` 1.54.1 and `webpki-roots` 1.0.10 or newer,
+  excluding versions affected by RUSTSEC-2026-0346 to -0349, RUSTSEC-2026-0384
+  and RUSTSEC-2026-0381.
+
 ## [0.27.1] — 2026-10-13
 
 ### Fixed
@@ -1683,7 +1708,8 @@ Initial development: wire protocol, producer, consumer, admin client,
 authentication (SASL PLAIN / SCRAM / OAUTHBEARER / AWS MSK IAM), TLS,
 compression codecs, schema registry integration and the metrics layer.
 
-[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/hupe1980/krafka/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/hupe1980/krafka/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/hupe1980/krafka/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/hupe1980/krafka/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/hupe1980/krafka/compare/v0.25.0...v0.26.0

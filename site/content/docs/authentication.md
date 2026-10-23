@@ -348,7 +348,8 @@ let provider = OidcTokenProvider::builder("https://keycloak.internal/realms/kafk
     .build()?;
 ```
 
-The rule is the Kafka path's: `ca_cert` pins (only that bundle is trusted),
+`ca_cert_pem(pem)` takes the bundle from memory. The rule is the Kafka path's:
+`ca_cert` and `ca_cert_pem` pin (only that bundle is trusted),
 `native_roots()` (with the `native-tls-roots` feature) uses the platform store,
 and the two together add up. The HTTPS client selects its crypto provider the
 same way as the Kafka connections.
@@ -459,6 +460,59 @@ let tls_config = TlsConfig::new()
     .with_client_cert("/path/to/client.pem", "/path/to/client-key.pem");
 ```
 
+#### From memory
+
+Material from a secret manager or a control plane does not need a file. Pass
+the PEM itself (the Java client's `ssl.truststore.certificates`,
+`ssl.keystore.certificate.chain` and `ssl.keystore.key`; librdkafka's
+`ssl.ca.pem`, `ssl.certificate.pem` and `ssl.key.pem`):
+
+```rust,compile
+use krafka::auth::TlsConfig;
+
+// Your secret manager's client.
+async fn read_secret(name: &str) -> krafka::Result<String> {
+    Ok(format!("PEM of {name}"))
+}
+
+let tls_config = TlsConfig::new()
+    .with_ca_cert_pem(read_secret("kafka/ca").await?)
+    .with_client_cert_pem(
+        read_secret("kafka/client-cert").await?,
+        read_secret("kafka/client-key").await?.into_bytes(),
+    );
+```
+
+The chain holds certificates only, leaf first. The key is taken by value
+(`Vec<u8>`, or `String::into_bytes()`) and zeroized when the config is dropped;
+copies your code keeps are yours to wipe.
+`with_ca_cert_pem` pins as `with_ca_cert` does. Each setter replaces the other
+kind: one CA bundle, one client identity.
+
+**Rotating material** comes from a provider instead. It is called when the
+client is built and on every [reload](#certificate-rotation-kip-1288), never per
+connection:
+
+```rust,compile
+use krafka::auth::{TlsConfig, TlsIdentity};
+
+// Your control plane's client: a fresh short-lived certificate and key.
+async fn issue_certificate() -> krafka::Result<(String, String)> {
+    Ok(("PEM chain".to_string(), "PEM key".to_string()))
+}
+
+let tls_config = TlsConfig::new()
+    .with_ca_cert("/path/to/ca.pem")
+    .with_client_identity_provider(|| async {
+        let (chain, key) = issue_certificate().await?;
+        Ok(TlsIdentity::from_pem(chain, key.into_bytes()))
+    });
+```
+
+A provider that fails, panics or takes longer than `request_timeout` fails the
+client build; on a reload it leaves the previous identity in use. Key material
+never appears in `Debug` output.
+
 #### Encrypted private keys
 
 A passphrase-protected client key (the Java client's and librdkafka's
@@ -495,15 +549,16 @@ Convert a rejected key with:
 openssl pkcs8 -topk8 -v2 aes256 -in old.key -out client-key.pem
 ```
 
-The passphrase stays in memory for the life of the config, because
-[certificate rotation](#certificate-rotation-kip-1288) reads the key file again,
-and is zeroized when the config is dropped. A rotated key must use the same
-passphrase. A passphrase with no client certificate and key configured is a
-configuration error.
+The passphrase applies to a key from any source. It stays in memory for the
+life of the config, because [certificate rotation](#certificate-rotation-kip-1288)
+parses the key again, and is zeroized when the config is dropped. An identity
+from a provider may carry its own (`TlsIdentity::with_key_password`), which
+takes precedence. A passphrase with no client certificate and key configured is
+a configuration error.
 
-The PEM file contents and the decrypted key are zeroized in krafka's buffers.
-The decrypted key is then handed to rustls, which frees its copy, and the
-crypto backend's parsed key, without zeroizing; that is outside krafka's
+The PEM contents and the decrypted key are zeroized in krafka's buffers.
+The PEM parser's working buffer, rustls's copy of the key and the crypto
+backend's parsed key are freed without zeroizing; that is outside krafka's
 control.
 
 ### SNI Hostname
@@ -518,8 +573,9 @@ let tls_config = TlsConfig::new().with_sni_hostname("kafka.example.com");
 
 ### Certificate rotation (KIP-1288)
 
-Certificates rotated on disk by cert-manager, Vault or an SDS sidecar are picked
-up without restarting the process (KIP-1288), on demand or on a timer.
+Certificates rotated by cert-manager, Vault or an SDS sidecar are picked up
+without restarting the process (KIP-1288), on demand or on a timer. A reload
+reads files again and calls a client identity provider once.
 
 **Event-driven** — call `refresh_tls()` on the `Kafka` handle when your
 watcher fires:
@@ -545,9 +601,9 @@ Both paths behave the same way:
 
 - **Existing TLS sessions are unaffected.** Only connections opened after a
   successful reload use the new material.
-- **A failed reload keeps the old certificates.** A half-written PEM logs a
-  warning and changes nothing; the next attempt picks up the finished file.
-- **No-op without TLS.** Nothing on disk to reload.
+- **A failed reload keeps the old certificates.** `refresh_tls()` returns the
+  error; the timer logs it as a warning and retries on the next tick.
+- **No-op without TLS.** Nothing to reload.
 
 Every client built from the handle shares its pool, so one reload rotates
 certificates for all of them.
@@ -704,9 +760,8 @@ The implementation uses AWS Signature v4 signing:
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `ca_cert_path` | `Option<String>` | Path to CA certificate PEM file |
-| `client_cert_path` | `Option<String>` | Path to client certificate PEM file |
-| `client_key_path` | `Option<String>` | Path to client private key PEM file |
+| CA bundle | path or PEM | `with_ca_cert(path)` or `with_ca_cert_pem(pem)`; `ca_cert_path()` reads back a path |
+| Client identity | paths, PEM, or provider | `with_client_cert(cert, key)`, `with_client_cert_pem(chain, key)` or `with_client_identity_provider(p)`; `client_cert_path()` / `client_key_path()` read back paths |
 | `client_key_password` | `Option<Zeroizing<String>>` | Passphrase for an encrypted client key (`tls-encrypted-keys` feature); redacted in `Debug` |
 | `use_native_roots` | `bool` | Whether to load root certificates from the platform trust store |
 | `verify_server_cert` | `bool` | Whether to verify server certificates (default: true) |
