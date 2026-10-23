@@ -11,6 +11,7 @@
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::client::WantsClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -27,8 +28,11 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tracing::warn;
 
-use crate::auth::{CaSource, ClientIdentitySource, TlsConfig, TlsIdentity};
+use crate::auth::{
+    CaSource, ClientIdentitySource, TlsConfig, TlsIdentity, TlsIdentityProviderHandle,
+};
 use crate::error::{KrafkaError, Result};
+use crate::util::AbortOnDrop;
 
 // ---------------------------------------------------------------------------
 // Public async API — each function wraps the sync implementation in a single
@@ -37,9 +41,10 @@ use crate::error::{KrafkaError, Result};
 
 /// Build a rustls [`ClientConfig`] from [`TlsConfig`].
 ///
-/// A client identity provider is called first, on the async runtime. Then
-/// all file I/O (certificates, keys, native root store), parsing and key
-/// decryption run inside `spawn_blocking` so they never block the runtime.
+/// A client identity provider is called first, in its own task and bounded
+/// by `provider_timeout`. Then all file I/O (certificates, keys, native root
+/// store), parsing and key decryption run inside `spawn_blocking` so they
+/// never block the runtime.
 ///
 /// When `verify_server_cert` is `false`, certificate verification is skipped
 /// entirely. This is useful for local development with self-signed certificates
@@ -49,9 +54,14 @@ use crate::error::{KrafkaError, Result};
 /// # Errors
 ///
 /// Returns an error if certificate/key files cannot be read or parsed.
-pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
+pub async fn build_tls_config(
+    config: &TlsConfig,
+    provider_timeout: Duration,
+) -> Result<ClientConfig> {
     let fetched = match &config.client_identity {
-        Some(ClientIdentitySource::Provider(provider)) => Some(provider.provide_identity().await?),
+        Some(ClientIdentitySource::Provider(provider)) => {
+            Some(fetch_identity(provider, provider_timeout).await?)
+        }
         _ => None,
     };
     // Cheap: in-memory material is behind `Arc`, so no key bytes are copied.
@@ -63,7 +73,8 @@ pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
     .map_err(|e| KrafkaError::config(format!("Failed to spawn blocking task: {e}")))?
 }
 
-/// Build a [`TlsConnector`] from [`TlsConfig`].
+/// Build a [`TlsConnector`] from [`TlsConfig`]; `provider_timeout` bounds a
+/// client identity provider call.
 ///
 /// Convenience wrapper around [`build_tls_config`] that produces a ready-to-use
 /// connector for [`connect_tls`].
@@ -71,9 +82,33 @@ pub async fn build_tls_config(config: &TlsConfig) -> Result<ClientConfig> {
 /// # Errors
 ///
 /// Returns an error if certificate/key files cannot be read or parsed.
-pub async fn build_tls_connector(config: &TlsConfig) -> Result<TlsConnector> {
-    let client_config = build_tls_config(config).await?;
+pub async fn build_tls_connector(
+    config: &TlsConfig,
+    provider_timeout: Duration,
+) -> Result<TlsConnector> {
+    let client_config = build_tls_config(config, provider_timeout).await?;
     Ok(TlsConnector::from(Arc::new(client_config)))
+}
+
+/// Call the client identity provider in its own task, bounded by `limit`.
+///
+/// A hung provider is a timeout and a panicking one an error, so neither
+/// stalls a client build nor ends the periodic reload task.
+async fn fetch_identity(
+    provider: &TlsIdentityProviderHandle,
+    limit: Duration,
+) -> Result<TlsIdentity> {
+    let provider = provider.clone();
+    let mut task = AbortOnDrop(tokio::spawn(
+        async move { provider.provide_identity().await },
+    ));
+    match tokio::time::timeout(limit, &mut task.0).await {
+        Ok(Ok(identity)) => identity,
+        Ok(Err(e)) => Err(KrafkaError::config(format!(
+            "client identity provider failed: {e}"
+        ))),
+        Err(_) => Err(KrafkaError::timeout("client identity provider")),
+    }
 }
 
 /// Connect with TLS using a pre-built connector.
@@ -304,8 +339,13 @@ fn load_private_key(path: &str, password: Option<&str>) -> Result<PrivateKeyDer<
     }
 
     // Zeroized on drop: the PEM text holds the private key in cleartext, and
-    // the parsed `PrivateKeyDer` does not take ownership of this buffer.
-    let mut pem = zeroize::Zeroizing::new(Vec::new());
+    // the parsed `PrivateKeyDer` does not take ownership of this buffer. Sized
+    // from the file so `read_to_end` never reallocates, which would free a
+    // partial copy unzeroized.
+    let len = file.metadata().map_or(0, |m| m.len());
+    let mut pem = zeroize::Zeroizing::new(Vec::with_capacity(
+        usize::try_from(len).unwrap_or(0).saturating_add(1),
+    ));
     file.read_to_end(&mut pem)
         .map_err(|e| KrafkaError::config(format!("Failed to read {source}: {e}")))?;
 
@@ -1005,7 +1045,9 @@ mod tests {
         assert_eq!(config.client_cert_path(), None);
         assert_eq!(config.client_key_path(), None);
 
-        let connector = build_tls_connector(&config).await.unwrap();
+        let connector = build_tls_connector(&config, Duration::from_secs(30))
+            .await
+            .unwrap();
         let seen = presented_by(&connector).await.expect("handshake");
         assert_eq!(seen, Some(first_cert("client.pem")));
     }
@@ -1058,18 +1100,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tls-encrypted-keys")]
-    fn encrypted_key_in_a_combined_blob_from_memory_decrypts() {
-        setup_crypto_provider();
-        let mut blob = testdata_bytes("client.pem");
-        blob.extend(testdata_bytes("client-pbes2.key"));
-        let config = TlsConfig::new()
-            .with_client_cert_pem(blob.clone(), blob)
-            .with_client_key_password("krafka-test");
-        build_tls_config_sync(&config).expect("certificates and key are each taken from the blob");
-    }
-
-    #[test]
     fn material_with_no_certificate_is_rejected_at_build() {
         setup_crypto_provider();
         let dir = std::env::temp_dir().join(format!("krafka-tls-empty-{}", std::process::id()));
@@ -1094,12 +1124,26 @@ mod tests {
         }
     }
 
+    /// Pinning: the bundle is the whole trust store, with no default roots
+    /// added, whatever its size.
+    #[test]
+    fn an_in_memory_ca_bundle_is_the_whole_trust_store() {
+        let mut two = testdata_bytes("ca.pem");
+        two.extend(testdata_bytes("client.pem"));
+        for (pem, certs) in [(testdata_bytes("ca.pem"), 1), (two, 2)] {
+            let store = load_root_store(&TlsConfig::new().with_ca_cert_pem(pem)).unwrap();
+            assert_eq!(store.len(), certs);
+        }
+    }
+
     #[tokio::test]
     async fn an_in_memory_ca_pins() {
         setup_crypto_provider();
         // `client.pem` is a CA, but not the one that issued `server.pem`.
         let config = TlsConfig::new().with_ca_cert_pem(testdata_bytes("client.pem"));
-        let connector = build_tls_connector(&config).await.unwrap();
+        let connector = build_tls_connector(&config, Duration::from_secs(30))
+            .await
+            .unwrap();
         assert!(presented_by(&connector).await.is_err());
     }
 

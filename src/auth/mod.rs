@@ -37,6 +37,7 @@ pub(crate) use provider::ErasedCredentialProvider;
 pub use scram::ScramMechanism;
 
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -510,8 +511,8 @@ pub struct TlsIdentity {
 }
 
 impl TlsIdentity {
-    /// An identity from a PEM certificate chain (leaf first) and a PEM
-    /// private key.
+    /// An identity from a PEM certificate chain (certificates only, leaf
+    /// first) and a PEM private key.
     ///
     /// The key is taken by value, so krafka owns the only copy it makes and
     /// zeroizes it on drop; pass a `String` as `pem.into_bytes()`. Copies the
@@ -578,12 +579,26 @@ impl fmt::Debug for TlsIdentity {
 }
 
 /// A shared [`CredentialProvider`] of client TLS identities.
-#[derive(Clone)]
-pub(crate) struct TlsIdentityProviderHandle(Arc<dyn ErasedCredentialProvider<TlsIdentity>>);
+///
+/// `AssertUnwindSafe` keeps [`TlsConfig`] `UnwindSafe`: krafka holds no state
+/// of its own across a provider call that a panic could leave half-updated.
+pub(crate) struct TlsIdentityProviderHandle(
+    AssertUnwindSafe<Arc<dyn ErasedCredentialProvider<TlsIdentity>>>,
+);
 
 impl TlsIdentityProviderHandle {
+    fn new(provider: impl CredentialProvider<TlsIdentity> + 'static) -> Self {
+        Self(AssertUnwindSafe(Arc::new(provider)))
+    }
+
     pub(crate) async fn provide_identity(&self) -> crate::error::Result<TlsIdentity> {
         self.0.credentials_erased().await
+    }
+}
+
+impl Clone for TlsIdentityProviderHandle {
+    fn clone(&self) -> Self {
+        Self(AssertUnwindSafe(Arc::clone(&self.0)))
     }
 }
 
@@ -811,9 +826,10 @@ impl TlsConfig {
     /// The provider is called once when the client is built and once on
     /// every TLS reload ([`Kafka::refresh_tls`](crate::Kafka::refresh_tls),
     /// [`tls_reload_interval`](crate::KafkaBuilder::tls_reload_interval)),
-    /// never per connection. If it fails at build, the build fails; if it
-    /// fails on a reload, the reload returns the error and new connections
-    /// keep the previous identity.
+    /// never per connection. A call that fails, panics or outlasts
+    /// [`request_timeout`](crate::KafkaBuilder::request_timeout) fails the
+    /// build, or fails the reload and leaves new connections on the previous
+    /// identity.
     ///
     /// ```rust
     /// use krafka::auth::{TlsConfig, TlsIdentity};
@@ -828,9 +844,9 @@ impl TlsConfig {
         mut self,
         provider: impl CredentialProvider<TlsIdentity> + 'static,
     ) -> Self {
-        self.client_identity = Some(ClientIdentitySource::Provider(TlsIdentityProviderHandle(
-            Arc::new(provider),
-        )));
+        self.client_identity = Some(ClientIdentitySource::Provider(
+            TlsIdentityProviderHandle::new(provider),
+        ));
         self
     }
 

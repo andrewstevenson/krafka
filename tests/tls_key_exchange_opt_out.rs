@@ -57,9 +57,12 @@ async fn an_installed_x25519_only_provider_turns_post_quantum_off() {
         acceptor.accept(tcp).await.map(drop)
     });
 
-    let connector = build_tls_connector(&TlsConfig::new().with_ca_cert(testdata("ca.pem")))
-        .await
-        .unwrap();
+    let connector = build_tls_connector(
+        &TlsConfig::new().with_ca_cert(testdata("ca.pem")),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
     let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
     let tls = connect_tls(tcp, &addr, None, &connector).await.unwrap();
     accept.await.unwrap().unwrap();

@@ -23,6 +23,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::util::AbortOnDrop;
+
 use crate::client::Kafka;
 use crate::error::{KrafkaError, Result};
 use crate::metrics::{ClientInstanceId, MetricsSource};
@@ -145,15 +147,6 @@ impl Telemetry {
             Ok(Err(_)) => Ok(None),
             Err(_) => Err(KrafkaError::timeout("waiting for the client instance id")),
         }
-    }
-}
-
-/// Aborts the task when dropped; a no-op once it has finished.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 

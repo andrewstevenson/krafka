@@ -483,9 +483,9 @@ let tls_config = TlsConfig::new()
     );
 ```
 
-The chain is leaf first; one PEM blob holding chain and key can be passed for
-both. The key is taken by value (`Vec<u8>`, or `String::into_bytes()`) and
-zeroized when the config is dropped; copies your code keeps are yours to wipe.
+The chain holds certificates only, leaf first. The key is taken by value
+(`Vec<u8>`, or `String::into_bytes()`) and zeroized when the config is dropped;
+copies your code keeps are yours to wipe.
 `with_ca_cert_pem` pins as `with_ca_cert` does. Each setter replaces the other
 kind: one CA bundle, one client identity.
 
@@ -509,9 +509,9 @@ let tls_config = TlsConfig::new()
     });
 ```
 
-A provider that fails when the client is built fails the build; one that fails
-on a reload leaves the previous identity in use. Key material never appears in
-`Debug` output.
+A provider that fails, panics or takes longer than `request_timeout` fails the
+client build; on a reload it leaves the previous identity in use. Key material
+never appears in `Debug` output.
 
 #### Encrypted private keys
 
@@ -557,8 +557,8 @@ takes precedence. A passphrase with no client certificate and key configured is
 a configuration error.
 
 The PEM contents and the decrypted key are zeroized in krafka's buffers.
-The decrypted key is then handed to rustls, which frees its copy, and the
-crypto backend's parsed key, without zeroizing; that is outside krafka's
+The PEM parser's working buffer, rustls's copy of the key and the crypto
+backend's parsed key are freed without zeroizing; that is outside krafka's
 control.
 
 ### SNI Hostname
@@ -601,9 +601,8 @@ Both paths behave the same way:
 
 - **Existing TLS sessions are unaffected.** Only connections opened after a
   successful reload use the new material.
-- **A failed reload keeps the old certificates.** A half-written PEM or a
-  failing provider logs a warning and changes nothing; the next attempt picks
-  up the finished material.
+- **A failed reload keeps the old certificates.** `refresh_tls()` returns the
+  error; the timer logs it as a warning and retries on the next tick.
 - **No-op without TLS.** Nothing to reload.
 
 Every client built from the handle shares its pool, so one reload rotates

@@ -1122,8 +1122,7 @@ mod tests {
             .expect("the in-memory CA must verify the endpoint");
     }
 
-    /// The in-memory bundle pins: a CA that did not issue the endpoint's
-    /// certificate is not trusted, and the default roots are not added.
+    /// A CA that did not issue the endpoint's certificate is not trusted.
     #[tokio::test]
     async fn an_in_memory_ca_pins_the_endpoint() {
         let endpoint = token_endpoint(ok_response(r#"{"access_token":"tok-1"}"#)).await;

@@ -23,7 +23,7 @@ not a complete record.
   zeroized on drop; encrypted keys decrypt with `with_client_key_password()`.
 - **A rotating client identity**: `TlsConfig::with_client_identity_provider()`
   takes a `CredentialProvider<TlsIdentity>`, called at client build and on each
-  `refresh_tls()` / `tls_reload_interval` reload.
+  `refresh_tls()` / `tls_reload_interval` reload, bounded by `request_timeout`.
 
 ### Changed
 

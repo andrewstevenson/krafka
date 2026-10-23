@@ -433,3 +433,14 @@ fn tls_material_is_settable_from_memory_and_from_a_provider() {
     let _ = krafka::auth::OidcTokenProvider::builder("https://idp.example.com/token")
         .ca_cert_pem("-----BEGIN CERTIFICATE-----");
 }
+
+/// Removing an auto trait from a public type is a semver break; these must
+/// hold whatever TLS source is configured.
+#[test]
+fn tls_types_keep_their_auto_traits() {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
+
+    fn auto_traits<T: Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+    auto_traits::<krafka::auth::TlsConfig>();
+    auto_traits::<krafka::auth::TlsIdentity>();
+}

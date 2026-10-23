@@ -276,6 +276,9 @@ pub struct ConnectionConfig {
     /// the same connector and [`refresh_tls()`](ConnectionConfig::refresh_tls)
     /// atomically updates it for every future connection.
     pub(crate) tls_connector: Arc<ArcSwap<Option<TlsConnector>>>,
+    /// Serialises TLS reloads across clones, so a slow reload cannot store
+    /// its older material over a newer one.
+    pub(crate) tls_reload: Arc<tokio::sync::Mutex<()>>,
     /// TCP keepalive interval.
     ///
     /// When set, enables TCP keepalive on all broker connections with the
@@ -358,10 +361,10 @@ impl ConnectionConfig {
     /// Pre-build and cache the TLS connector from the configured certificates.
     ///
     /// When TLS is configured, this loads the TLS material once — calling a
-    /// client identity provider, then reading and parsing in
-    /// `spawn_blocking` — and stores the resulting [`TlsConnector`] for reuse
-    /// across all connections and reconnections. Without this call, every
-    /// connection attempt builds its own connector.
+    /// client identity provider (bounded by `request_timeout`), then reading
+    /// and parsing in `spawn_blocking` — and stores the resulting
+    /// [`TlsConnector`] for reuse across all connections and reconnections.
+    /// Without this call, every connection attempt builds its own connector.
     ///
     /// This is a no-op when no TLS configuration is present.
     ///
@@ -372,7 +375,7 @@ impl ConnectionConfig {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let connector = build_tls_connector(tls_config).await?;
+            let connector = build_tls_connector(tls_config, self.request_timeout).await?;
             self.tls_connector.store(Arc::new(Some(connector)));
         }
         Ok(())
@@ -400,7 +403,8 @@ impl ConnectionConfig {
         if let Some(ref auth) = self.auth
             && let Some(ref tls_config) = auth.tls_config
         {
-            let connector = build_tls_connector(tls_config).await?;
+            let _reload = self.tls_reload.lock().await;
+            let connector = build_tls_connector(tls_config, self.request_timeout).await?;
             self.tls_connector.store(Arc::new(Some(connector)));
             info!("TLS connector refreshed");
         }
@@ -504,6 +508,7 @@ impl Default for ConnectionConfigBuilder {
             max_in_flight_requests: 10,
             auth: None,
             tls_connector: Arc::new(ArcSwap::new(Arc::new(None))),
+            tls_reload: Arc::new(tokio::sync::Mutex::new(())),
             tcp_keepalive: Some(Duration::from_secs(60)),
             connection_attempt_delay: Duration::from_millis(250),
             msk_iam_clock_offset_secs: Arc::new(AtomicI64::new(0)),
@@ -1040,7 +1045,7 @@ impl BrokerConnection {
             // identity provider — per connection.
             let connector = match &**config.tls_connector.load() {
                 Some(c) => c.clone(),
-                None => build_tls_connector(tls_config).await?,
+                None => build_tls_connector(tls_config, config.request_timeout).await?,
             };
 
             // Extract hostname (without port) for TLS SNI.
@@ -4810,5 +4815,91 @@ mod tests {
             "got: {err}"
         );
         assert!(current_tls_connector(&config).is_none());
+    }
+
+    /// Real connections use the connector cached at init; none calls the
+    /// provider again.
+    #[tokio::test]
+    async fn connections_reuse_the_identity_fetched_at_init() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                drop(tcp);
+            }
+        });
+
+        let (tls, calls) = rotating_tls(&["client", "client-b", "client-b"]);
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        config.init_tls().await.unwrap();
+        for _ in 0..2 {
+            // The listener drops the socket, so the handshake fails; the
+            // connector was chosen before that.
+            let _ = BrokerConnection::connect(&addr, config.clone()).await;
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_identity_provider_times_out() {
+        let tls = crate::auth::TlsConfig::new().with_client_identity_provider(|| async {
+            std::future::pending::<crate::Result<crate::auth::TlsIdentity>>().await
+        });
+        let mut config = ConnectionConfig::builder()
+            .connect_timeout(Duration::from_millis(50))
+            .request_timeout(Duration::from_millis(100))
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), config.init_tls())
+            .await
+            .expect("bounded by request_timeout")
+            .unwrap_err();
+        assert!(matches!(err, KrafkaError::Timeout { .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_identity_provider_is_an_error() {
+        let tls = crate::auth::TlsConfig::new()
+            .with_client_identity_provider(|| async { panic!("provider bug") });
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        let err = config.init_tls().await.unwrap_err();
+        assert!(err.to_string().contains("panicked"), "got: {err}");
+    }
+
+    /// A slow reload that started first must not store its older identity
+    /// over a newer one stored meanwhile.
+    #[tokio::test]
+    async fn concurrent_reloads_keep_the_newest_identity() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let tls = crate::auth::TlsConfig::new()
+            .with_ca_cert_pem(crate::auth::tls::test_support::testdata_bytes("ca.pem"))
+            .with_client_identity_provider(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n == 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Ok(identity(if n == 2 { "client-b" } else { "client" }))
+                }
+            });
+        let mut config = ConnectionConfig::builder()
+            .auth(AuthConfig::ssl(tls))
+            .build()
+            .unwrap();
+        config.init_tls().await.unwrap();
+
+        let (slow, fast) = tokio::join!(config.refresh_tls(), config.refresh_tls());
+        slow.unwrap();
+        fast.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(presented_cert(&config).await, cert_der("client-b"));
     }
 }
