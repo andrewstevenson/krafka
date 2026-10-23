@@ -159,6 +159,12 @@ status = "implemented"
 evidence = ["api:CreateTopics@6", "api:CreatePartitions@3", "api:DeleteTopics@5"]
 
 [[kip]]
+id = "KIP-651"
+title = "Support PEM format for SSL certificates and private key"
+status = "implemented"
+evidence = ["symbol:krafka::auth::TlsIdentity"]
+
+[[kip]]
 id = "KIP-664"
 title = "Provide tooling to detect and abort hanging transactions"
 status = "implemented"

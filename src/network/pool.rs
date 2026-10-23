@@ -288,8 +288,8 @@ impl ConnectionPool {
         self.max_total_connections
     }
 
-    /// Re-read TLS certificate files from disk and atomically update the
-    /// shared connector used by all future connections and reconnections.
+    /// Reload the TLS material and atomically update the shared connector
+    /// used by all future connections and reconnections.
     ///
     /// Existing TLS sessions are unaffected. On error the previous connector
     /// remains active.
@@ -704,13 +704,13 @@ impl ConnectionPool {
 
     /// Start the background TLS certificate reload task (KIP-1288).
     ///
-    /// Every `interval`, re-reads the configured certificate, key and
-    /// trust-store files from disk and atomically swaps the connector used by
+    /// Every `interval`, reloads the configured certificate, key and
+    /// trust-store material and atomically swaps the connector used by
     /// all *future* connections. Existing TLS sessions keep the connector they
     /// handshaked with.
     ///
     /// No-op unless the pool's `AuthConfig` carries a TLS configuration —
-    /// there is nothing on disk to reload otherwise — and no-op outside a Tokio
+    /// there is nothing to reload otherwise — and no-op outside a Tokio
     /// runtime.
     ///
     /// A failed reload (file missing mid-rotation, half-written PEM) is logged

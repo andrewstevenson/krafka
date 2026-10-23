@@ -121,14 +121,16 @@ impl Kafka {
         crate::admin::AdminClient::new(self.clone())
     }
 
-    /// Re-read TLS certificate and key files from disk and use them for every
-    /// connection opened from now on, by every client of this handle
-    /// (KIP-1288). Existing TLS sessions are unaffected. No-op without TLS.
+    /// Reload the TLS material and use it for every connection opened from
+    /// now on, by every client of this handle (KIP-1288): files are read
+    /// again, in-memory PEM is parsed again, and a client identity provider
+    /// is called once. Existing TLS sessions are unaffected. No-op without
+    /// TLS.
     ///
     /// # Errors
     ///
-    /// Returns an error if the files cannot be read or parsed; the previous
-    /// material stays active.
+    /// Returns an error if the material cannot be read, fetched or parsed;
+    /// the previous material stays active.
     pub async fn refresh_tls(&self) -> Result<()> {
         self.inner.pool.refresh_tls().await
     }
@@ -449,8 +451,9 @@ impl KafkaBuilder {
         self
     }
 
-    /// Re-read TLS certificate and key files every `interval` (KIP-1288), or
-    /// `None` to reload only on [`Kafka::refresh_tls`]. Default: `None`.
+    /// Reload the TLS material every `interval` (KIP-1288), as
+    /// [`Kafka::refresh_tls`] does, or `None` to reload only on that call.
+    /// Default: `None`.
     pub fn tls_reload_interval(mut self, interval: Option<Duration>) -> Self {
         self.transport = self.transport.tls_reload_interval(interval);
         self

@@ -122,8 +122,9 @@ pub struct TransportConfig {
     /// matters for a fetch-heavy client on a long link.
     pub(crate) socket_receive_buffer: Option<usize>,
 
-    /// Interval at which TLS certificate and key files are re-read from disk,
-    /// or `None` to never reload automatically. Default: `None`.
+    /// Interval at which the TLS material is reloaded, as
+    /// [`Kafka::refresh_tls`](crate::Kafka::refresh_tls) does, or `None` to
+    /// never reload automatically. Default: `None`.
     ///
     /// This is krafka's answer to KIP-1288 (SSL hot reload, Kafka 4.2): a
     /// client whose certificates are rotated by cert-manager, Vault or an
@@ -370,7 +371,7 @@ impl TransportConfigBuilder {
         self
     }
 
-    /// Re-read TLS certificate files from disk every `interval` (KIP-1288).
+    /// Reload the TLS material every `interval` (KIP-1288).
     /// Pass `None` to disable automatic reloading.
     /// See [`TransportConfig::tls_reload_interval`].
     pub fn tls_reload_interval(mut self, interval: Option<Duration>) -> Self {

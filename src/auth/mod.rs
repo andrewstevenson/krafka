@@ -493,6 +493,147 @@ impl fmt::Debug for AwsMskIamCredentials {
     }
 }
 
+/// A client certificate chain and private key held in memory, for mTLS.
+///
+/// What [`TlsConfig::with_client_identity_provider`]'s provider returns. The
+/// key is zeroized when the last clone is dropped; clones share the bytes.
+///
+/// The key must be PEM: `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY`,
+/// `EC PRIVATE KEY`, or `ENCRYPTED PRIVATE KEY` with a passphrase (see
+/// [`TlsConfig::with_client_key_password`]).
+#[derive(Clone)]
+pub struct TlsIdentity {
+    cert_chain_pem: Arc<[u8]>,
+    private_key_pem: Arc<Zeroizing<Vec<u8>>>,
+    #[cfg(feature = "tls-encrypted-keys")]
+    key_password: Option<Arc<Zeroizing<String>>>,
+}
+
+impl TlsIdentity {
+    /// An identity from a PEM certificate chain (leaf first) and a PEM
+    /// private key.
+    ///
+    /// The key is taken by value, so krafka owns the only copy it makes and
+    /// zeroizes it on drop; pass a `String` as `pem.into_bytes()`. Copies the
+    /// caller keeps elsewhere are the caller's to wipe.
+    pub fn from_pem(
+        cert_chain_pem: impl Into<Vec<u8>>,
+        private_key_pem: impl Into<Zeroizing<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            cert_chain_pem: cert_chain_pem.into().into(),
+            private_key_pem: Arc::new(private_key_pem.into()),
+            #[cfg(feature = "tls-encrypted-keys")]
+            key_password: None,
+        }
+    }
+
+    /// Set the passphrase of an `ENCRYPTED PRIVATE KEY`.
+    ///
+    /// Takes precedence over [`TlsConfig::with_client_key_password`] for this
+    /// identity. Requires the `tls-encrypted-keys` crate feature.
+    #[cfg(feature = "tls-encrypted-keys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls-encrypted-keys")))]
+    pub fn with_key_password(mut self, password: impl Into<String>) -> Self {
+        self.key_password = Some(Arc::new(Zeroizing::new(password.into())));
+        self
+    }
+
+    pub(crate) fn cert_chain_pem(&self) -> &[u8] {
+        &self.cert_chain_pem
+    }
+
+    pub(crate) fn private_key_pem(&self) -> &[u8] {
+        &self.private_key_pem
+    }
+
+    /// The identity's own passphrase, if it has one.
+    pub(crate) fn key_password(&self) -> Option<&str> {
+        #[cfg(feature = "tls-encrypted-keys")]
+        {
+            self.key_password.as_deref().map(|p| p.as_str())
+        }
+        #[cfg(not(feature = "tls-encrypted-keys"))]
+        {
+            None
+        }
+    }
+}
+
+impl fmt::Debug for TlsIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("TlsIdentity");
+        s.field(
+            "cert_chain_pem",
+            &format_args!("<{} bytes>", self.cert_chain_pem.len()),
+        )
+        .field("private_key_pem", &"[REDACTED]");
+        #[cfg(feature = "tls-encrypted-keys")]
+        s.field(
+            "key_password",
+            &self.key_password.as_ref().map(|_| "[REDACTED]"),
+        );
+        s.finish()
+    }
+}
+
+/// A shared [`CredentialProvider`] of client TLS identities.
+#[derive(Clone)]
+pub(crate) struct TlsIdentityProviderHandle(Arc<dyn ErasedCredentialProvider<TlsIdentity>>);
+
+impl TlsIdentityProviderHandle {
+    pub(crate) async fn provide_identity(&self) -> crate::error::Result<TlsIdentity> {
+        self.0.credentials_erased().await
+    }
+}
+
+impl fmt::Debug for TlsIdentityProviderHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[TlsIdentityProvider]")
+    }
+}
+
+/// Where the CA bundle comes from.
+#[derive(Clone)]
+pub(crate) enum CaSource {
+    Path(String),
+    Pem(Arc<[u8]>),
+}
+
+impl fmt::Debug for CaSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            Self::Pem(pem) => write!(f, "Pem(<{} bytes>)", pem.len()),
+        }
+    }
+}
+
+/// Where the client certificate chain and key come from.
+#[derive(Clone)]
+pub(crate) enum ClientIdentitySource {
+    Files { cert_path: String, key_path: String },
+    Pem(TlsIdentity),
+    Provider(TlsIdentityProviderHandle),
+}
+
+impl fmt::Debug for ClientIdentitySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Files {
+                cert_path,
+                key_path,
+            } => f
+                .debug_struct("Files")
+                .field("cert_path", cert_path)
+                .field("key_path", key_path)
+                .finish(),
+            Self::Pem(identity) => f.debug_tuple("Pem").field(identity).finish(),
+            Self::Provider(provider) => f.debug_tuple("Provider").field(provider).finish(),
+        }
+    }
+}
+
 /// TLS configuration.
 ///
 /// Use [`TlsConfig::new()`] or [`Default::default()`] to construct.
@@ -500,16 +641,14 @@ impl fmt::Debug for AwsMskIamCredentials {
 /// CA bundle), use [`TlsConfig::insecure()`].
 #[derive(Clone)]
 pub struct TlsConfig {
-    /// Path to CA certificate file.
-    pub(crate) ca_cert_path: Option<String>,
-    /// Path to client certificate file.
-    pub(crate) client_cert_path: Option<String>,
-    /// Path to client private key file.
-    pub(crate) client_key_path: Option<String>,
+    /// CA bundle to pin, from a file or from memory.
+    pub(crate) ca_cert: Option<CaSource>,
+    /// Client certificate chain and private key (mTLS).
+    pub(crate) client_identity: Option<ClientIdentitySource>,
     /// Passphrase for an encrypted client private key (zeroized on drop).
     ///
-    /// Kept for the lifetime of the config because certificate reloads read
-    /// the key file again.
+    /// Kept for the lifetime of the config because certificate reloads parse
+    /// the key again.
     pub(crate) client_key_password: Option<Zeroizing<String>>,
     /// Whether to load root certificates from the platform trust store.
     pub(crate) use_native_roots: bool,
@@ -528,9 +667,8 @@ impl Default for TlsConfig {
     /// Returns a secure default: certificate verification enabled.
     fn default() -> Self {
         Self {
-            ca_cert_path: None,
-            client_cert_path: None,
-            client_key_path: None,
+            ca_cert: None,
+            client_identity: None,
             client_key_password: None,
             use_native_roots: false,
             verify_server_cert: true,
@@ -543,9 +681,8 @@ impl Default for TlsConfig {
 impl fmt::Debug for TlsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsConfig")
-            .field("ca_cert_path", &self.ca_cert_path)
-            .field("client_cert_path", &self.client_cert_path)
-            .field("client_key_path", &self.client_key_path)
+            .field("ca_cert", &self.ca_cert)
+            .field("client_identity", &self.client_identity)
             .field(
                 "client_key_password",
                 &self.client_key_password.as_ref().map(|_| "[REDACTED]"),
@@ -592,7 +729,18 @@ impl TlsConfig {
     /// To trust both platform roots **and** the custom CA, combine with
     /// `with_native_roots()`.
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
-        self.ca_cert_path = Some(path.into());
+        self.ca_cert = Some(CaSource::Path(path.into()));
+        self
+    }
+
+    /// Set the CA bundle from in-memory PEM (pinning).
+    ///
+    /// The same trust rule as [`with_ca_cert()`](Self::with_ca_cert), which
+    /// it replaces: only these certificates are trusted, plus the platform
+    /// roots when combined with `with_native_roots()`. The Java client's
+    /// `ssl.truststore.certificates` and librdkafka's `ssl.ca.pem`.
+    pub fn with_ca_cert_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_cert = Some(CaSource::Pem(pem.into().into()));
         self
     }
 
@@ -610,13 +758,79 @@ impl TlsConfig {
     }
 
     /// Set client certificate and key paths.
+    ///
+    /// Replaces a client identity set by
+    /// [`with_client_cert_pem()`](Self::with_client_cert_pem) or
+    /// [`with_client_identity_provider()`](Self::with_client_identity_provider).
+    /// TLS reloads read both files again.
     pub fn with_client_cert(
         mut self,
         cert_path: impl Into<String>,
         key_path: impl Into<String>,
     ) -> Self {
-        self.client_cert_path = Some(cert_path.into());
-        self.client_key_path = Some(key_path.into());
+        self.client_identity = Some(ClientIdentitySource::Files {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+        });
+        self
+    }
+
+    /// Set the client certificate chain and private key from in-memory PEM.
+    ///
+    /// The Java client's `ssl.keystore.certificate.chain` /
+    /// `ssl.keystore.key` and librdkafka's `ssl.certificate.pem` /
+    /// `ssl.key.pem`. The key is taken by value and zeroized on drop; an
+    /// encrypted key is decrypted with
+    /// [`with_client_key_password()`](Self::with_client_key_password). For
+    /// material that rotates, use
+    /// [`with_client_identity_provider()`](Self::with_client_identity_provider).
+    ///
+    /// ```rust
+    /// use krafka::auth::TlsConfig;
+    ///
+    /// # let (ca, cert, key) = (String::new(), String::new(), String::new());
+    /// // e.g. fetched from a secret manager
+    /// let tls = TlsConfig::new()
+    ///     .with_ca_cert_pem(ca)
+    ///     .with_client_cert_pem(cert, key.into_bytes());
+    /// ```
+    pub fn with_client_cert_pem(
+        mut self,
+        cert_chain_pem: impl Into<Vec<u8>>,
+        private_key_pem: impl Into<Zeroizing<Vec<u8>>>,
+    ) -> Self {
+        self.client_identity = Some(ClientIdentitySource::Pem(TlsIdentity::from_pem(
+            cert_chain_pem,
+            private_key_pem,
+        )));
+        self
+    }
+
+    /// Fetch the client certificate chain and key from `provider`.
+    ///
+    /// The provider is called once when the client is built and once on
+    /// every TLS reload ([`Kafka::refresh_tls`](crate::Kafka::refresh_tls),
+    /// [`tls_reload_interval`](crate::KafkaBuilder::tls_reload_interval)),
+    /// never per connection. If it fails at build, the build fails; if it
+    /// fails on a reload, the reload returns the error and new connections
+    /// keep the previous identity.
+    ///
+    /// ```rust
+    /// use krafka::auth::{TlsConfig, TlsIdentity};
+    ///
+    /// # async fn issue_certificate() -> krafka::Result<(String, String)> { unimplemented!() }
+    /// let tls = TlsConfig::new().with_client_identity_provider(|| async {
+    ///     let (cert, key) = issue_certificate().await?;
+    ///     Ok(TlsIdentity::from_pem(cert, key.into_bytes()))
+    /// });
+    /// ```
+    pub fn with_client_identity_provider(
+        mut self,
+        provider: impl CredentialProvider<TlsIdentity> + 'static,
+    ) -> Self {
+        self.client_identity = Some(ClientIdentitySource::Provider(TlsIdentityProviderHandle(
+            Arc::new(provider),
+        )));
         self
     }
 
@@ -631,7 +845,9 @@ impl TlsConfig {
     /// HMAC-SHA-1 are rejected; re-encrypt such keys with
     /// `openssl pkcs8 -topk8 -v2 aes256`.
     ///
-    /// An unencrypted key ignores the passphrase.
+    /// An unencrypted key ignores the passphrase. It applies to a key from a
+    /// file, from memory, or from a provider; an identity with its own
+    /// passphrase ([`TlsIdentity::with_key_password`]) uses that instead.
     ///
     /// ```rust
     /// use krafka::auth::TlsConfig;
@@ -654,19 +870,29 @@ impl TlsConfig {
         self
     }
 
-    /// Returns the CA certificate path, if set.
+    /// Returns the CA certificate path, if the CA bundle is set from a file.
     pub fn ca_cert_path(&self) -> Option<&str> {
-        self.ca_cert_path.as_deref()
+        match &self.ca_cert {
+            Some(CaSource::Path(path)) => Some(path),
+            _ => None,
+        }
     }
 
-    /// Returns the client certificate path, if set.
+    /// Returns the client certificate path, if the client identity is set
+    /// from files.
     pub fn client_cert_path(&self) -> Option<&str> {
-        self.client_cert_path.as_deref()
+        match &self.client_identity {
+            Some(ClientIdentitySource::Files { cert_path, .. }) => Some(cert_path),
+            _ => None,
+        }
     }
 
-    /// Returns the client key path, if set.
+    /// Returns the client key path, if the client identity is set from files.
     pub fn client_key_path(&self) -> Option<&str> {
-        self.client_key_path.as_deref()
+        match &self.client_identity {
+            Some(ClientIdentitySource::Files { key_path, .. }) => Some(key_path),
+            _ => None,
+        }
     }
 
     /// Returns whether platform-native root certificates are enabled.
@@ -1476,11 +1702,79 @@ mod tests {
 
         assert!(config.verify_server_cert);
         assert!(config.use_native_roots());
-        assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
-        assert_eq!(
-            config.client_cert_path,
-            Some("/path/to/client.pem".to_string())
-        );
+        assert_eq!(config.ca_cert_path(), Some("/path/to/ca.pem"));
+        assert_eq!(config.client_cert_path(), Some("/path/to/client.pem"));
+    }
+
+    /// One slot per item: a later setter of the other kind replaces the
+    /// earlier source instead of competing with it.
+    #[test]
+    fn the_last_tls_source_set_wins() {
+        let pem = TlsConfig::new()
+            .with_ca_cert("/ca.pem")
+            .with_client_cert("/c.pem", "/c.key")
+            .with_ca_cert_pem("ca")
+            .with_client_cert_pem("cert", b"key".to_vec());
+        assert!(matches!(pem.ca_cert, Some(CaSource::Pem(_))));
+        assert!(matches!(
+            pem.client_identity,
+            Some(ClientIdentitySource::Pem(_))
+        ));
+        assert_eq!(pem.ca_cert_path(), None);
+        assert_eq!(pem.client_cert_path(), None);
+        assert_eq!(pem.client_key_path(), None);
+
+        let provider = pem.clone().with_client_identity_provider(|| async {
+            Ok(TlsIdentity::from_pem("c", b"k".to_vec()))
+        });
+        assert!(matches!(
+            provider.client_identity,
+            Some(ClientIdentitySource::Provider(_))
+        ));
+
+        let files = provider
+            .with_ca_cert("/ca.pem")
+            .with_client_cert("/c.pem", "/c.key");
+        assert_eq!(files.ca_cert_path(), Some("/ca.pem"));
+        assert_eq!(files.client_cert_path(), Some("/c.pem"));
+        assert_eq!(files.client_key_path(), Some("/c.key"));
+    }
+
+    /// The base64 body lines of the test key: none may appear in `Debug`.
+    fn key_body_lines(pem: &str) -> Vec<&str> {
+        pem.lines().filter(|l| !l.starts_with("-----")).collect()
+    }
+
+    #[test]
+    fn tls_debug_shows_sources_but_no_key_material() {
+        let key = include_str!("testdata/client.key");
+        let cert = include_str!("testdata/client.pem");
+        let identity = TlsIdentity::from_pem(cert, key.as_bytes().to_vec());
+
+        let pem_config = TlsConfig::new()
+            .with_ca_cert_pem(cert)
+            .with_client_cert_pem(cert, key.as_bytes().to_vec());
+        let provider_config = TlsConfig::new().with_client_identity_provider(|| async {
+            Ok(TlsIdentity::from_pem("c", b"k".to_vec()))
+        });
+
+        for debug in [
+            format!("{identity:?}"),
+            format!("{pem_config:?}"),
+            format!("{provider_config:?}"),
+        ] {
+            for line in key_body_lines(key) {
+                assert!(!debug.contains(line), "key material in Debug: {debug}");
+            }
+            assert!(
+                !debug.contains("PRIVATE KEY"),
+                "key material in Debug: {debug}"
+            );
+        }
+        assert!(format!("{identity:?}").contains("[REDACTED]"));
+        assert!(format!("{pem_config:?}").contains("[REDACTED]"));
+        assert!(format!("{pem_config:?}").contains("Pem(<"));
+        assert!(format!("{provider_config:?}").contains("[TlsIdentityProvider]"));
     }
 
     #[test]

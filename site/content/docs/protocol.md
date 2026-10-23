@@ -244,6 +244,7 @@ not resolve, or if this table is edited by hand. Tracked against
 | KIP-559 | Make the Kafka protocol friendlier with L7 proxies | implemented | `JoinGroup` v7+, `SyncGroup` v5+ |  |
 | KIP-584 | Versioning scheme for features | implemented | `ApiVersions` v3+, `UpdateFeatures` v1+, `admin::FeatureMetadata`, `admin::UpdateFeaturesOptions` |  |
 | KIP-599 | Throttle create topic, create partition and delete topic operations | implemented | `CreateTopics` v6+, `CreatePartitions` v3+, `DeleteTopics` v5+ |  |
+| KIP-651 | Support PEM format for SSL certificates and private key | implemented | `auth::TlsIdentity` |  |
 | KIP-664 | Provide tooling to detect and abort hanging transactions | implemented | `DescribeProducers` v0+, `DescribeTransactions` v0+, `ListTransactions` v0+, `WriteTxnMarkers` v1+, `admin::ProducerState`, `admin::TransactionDescription`, `admin::TransactionListing`, `admin::AbortTransactionOptions` |  |
 | KIP-679 | Producer will enable the strongest delivery guarantee by default | implemented | `ProducerBuilder::idempotent` |  |
 | KIP-699 | Update FindCoordinator to resolve multiple coordinators at a time | implemented | `FindCoordinator` v4+ |  |

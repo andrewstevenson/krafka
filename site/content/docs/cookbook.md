@@ -474,9 +474,9 @@ every client built from it are gone.
 
 ## Rotate TLS certificates without a restart
 
-`refresh_tls()` re-reads the certificate files from disk and atomically swaps
-the connector. Existing sessions keep the connector they handshook with; every
-new connection uses the new material.
+`refresh_tls()` reloads the TLS material — files read again, a client identity
+provider called — and atomically swaps the connector. Existing sessions keep
+the connector they handshook with; every new connection uses the new material.
 
 ```rust,compile
 use std::time::Duration;

@@ -122,9 +122,9 @@ acknowledgement (KIP-932). An [admin client](@/docs/admin.md): topics, partition
 configs, ACLs, quotas, groups, delegation tokens, SCRAM credentials and cluster
 features.
 
-**Security.** TLS and mTLS over rustls with hot certificate reload (KIP-1288).
-SASL PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER, including a built-in OIDC token
-provider covering both the client-secret flow (KIP-768) and RFC 7523 client
+**Security.** TLS and mTLS over rustls, from files or in-memory PEM, with hot
+certificate reload (KIP-1288). SASL PLAIN, SCRAM-SHA-256/512 and OAUTHBEARER,
+including a built-in OIDC token provider covering both the client-secret flow (KIP-768) and RFC 7523 client
 assertions (KIP-1258), with no JWT or RSA dependency. Secrets are zeroized,
 credential comparison is constant-time, and no credential-bearing type derives
 `Debug`. See

@@ -47,6 +47,8 @@ one. Where they differ, both are given, librdkafka's as of 2.12.1/2.16.0
 | `sasl.kerberos.*` | **No equivalent.** GSSAPI/Kerberos is not implemented; see the [protocol page](@/docs/protocol.md#not-implemented). Use OAUTHBEARER if the cluster offers it | — |
 | `ssl.ca.location` | `TlsConfig::with_ca_cert(path)` — pins the trust store to that bundle | OpenSSL's default CA path (or `probe`) → Mozilla (WebPKI) roots compiled into the binary; `TlsConfig::with_native_roots` (feature `native-tls-roots`) reads the platform store |
 | `ssl.certificate.location`, `ssl.key.location` | `TlsConfig::with_client_cert(cert_path, key_path)` (PEM) | — |
+| `ssl.ca.pem` | `TlsConfig::with_ca_cert_pem(pem)` — pins, as `with_ca_cert` | as `ssl.ca.location` |
+| `ssl.certificate.pem`, `ssl.key.pem` | `TlsConfig::with_client_cert_pem(cert_pem, key_pem)`, or `with_client_identity_provider` for material that rotates | — |
 | `ssl.key.password` | `TlsConfig::with_client_key_password` (feature `tls-encrypted-keys`) | — |
 | `request.timeout.ms` | `KafkaBuilder::request_timeout`. In librdkafka this is the producer's broker-enforced ack timeout; in krafka it is the client-side bound on every request of every client, and must be at least `connect_timeout` | 30 s, same |
 | `socket.timeout.ms` | `KafkaBuilder::request_timeout` (above) is the closest equivalent | 60 s → 30 s |

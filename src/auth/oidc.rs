@@ -544,7 +544,25 @@ impl OidcTokenProviderBuilder {
     /// # }
     /// ```
     pub fn ca_cert(mut self, path: impl Into<String>) -> Self {
-        self.trust.ca_cert_path = Some(path.into());
+        self.trust = self.trust.with_ca_cert(path);
+        self
+    }
+
+    /// Trust only the in-memory PEM CA bundle `pem` for the token endpoint
+    /// (pinning). The rule of [`ca_cert`](Self::ca_cert), which it replaces.
+    ///
+    /// ```rust,no_run
+    /// # use krafka::auth::oidc::{ClientCredentials, OidcTokenProvider};
+    /// # fn f(ca_pem: String) -> Result<(), krafka::error::KrafkaError> {
+    /// OidcTokenProvider::builder("https://keycloak.internal/realms/kafka/protocol/openid-connect/token")
+    ///     .credentials(ClientCredentials::secret("id", "secret"))
+    ///     .ca_cert_pem(ca_pem)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ca_cert_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.trust = self.trust.with_ca_cert_pem(pem);
         self
     }
 
@@ -1089,6 +1107,36 @@ mod tests {
             initial.windows(17).any(|w| w == b"auth=Bearer tok-1"),
             "the fetched token must be the endpoint's"
         );
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_ca_reaches_an_endpoint_behind_it() {
+        let endpoint = token_endpoint(ok_response(r#"{"access_token":"tok-1"}"#)).await;
+        OidcTokenProvider::builder(&endpoint)
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .ca_cert_pem(std::fs::read(testdata("ca.pem")).unwrap())
+            .build()
+            .unwrap()
+            .fetch_token()
+            .await
+            .expect("the in-memory CA must verify the endpoint");
+    }
+
+    /// The in-memory bundle pins: a CA that did not issue the endpoint's
+    /// certificate is not trusted, and the default roots are not added.
+    #[tokio::test]
+    async fn an_in_memory_ca_pins_the_endpoint() {
+        let endpoint = token_endpoint(ok_response(r#"{"access_token":"tok-1"}"#)).await;
+        let err = OidcTokenProvider::builder(&endpoint)
+            .credentials(ClientCredentials::secret("id", "secret"))
+            .ca_cert_pem(std::fs::read(testdata("client.pem")).unwrap())
+            .build()
+            .unwrap()
+            .fetch_token()
+            .await
+            .expect_err("a CA that did not issue the endpoint certificate")
+            .to_string();
+        assert!(err.contains("UnknownIssuer"), "got: {err}");
     }
 
     /// Negative control: the default WebPKI roots do not know the test CA.
