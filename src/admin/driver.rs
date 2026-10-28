@@ -672,7 +672,7 @@ impl Call<'_> {
         if response.error_code.is_ok() {
             return Lookup::Found(Node {
                 id: response.node_id,
-                address: format!("{}:{}", response.host, response.port),
+                address: crate::util::broker_address(&response.host, response.port),
             });
         }
         let error = KrafkaError::broker(

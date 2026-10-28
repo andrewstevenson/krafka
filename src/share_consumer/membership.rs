@@ -386,7 +386,7 @@ async fn ensure_coordinator(inner: &Inner) -> Result<String> {
         };
         let response = FindCoordinatorResponse::decode_versioned(version, &mut buf.as_ref())?;
         if response.error_code.is_ok() {
-            let coordinator = format!("{}:{}", response.host, response.port);
+            let coordinator = crate::util::broker_address(&response.host, response.port);
             inner.member.lock().coordinator = Some(coordinator.clone());
             debug!(group = %group, node = response.node_id, "found the share group coordinator");
             return Ok(coordinator);

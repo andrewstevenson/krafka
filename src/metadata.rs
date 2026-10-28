@@ -83,7 +83,7 @@ pub struct BrokerInfo {
 impl BrokerInfo {
     /// Create a new `BrokerInfo`.
     pub fn new(id: BrokerId, host: String, port: i32, rack: Option<String>) -> Self {
-        let address = format!("{host}:{port}");
+        let address = crate::util::broker_address(&host, port);
         Self {
             id,
             host,

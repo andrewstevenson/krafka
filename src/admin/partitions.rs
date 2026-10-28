@@ -406,7 +406,9 @@ impl AdminClient {
             .await)
     }
 
-    /// List ongoing partition reassignments (any broker).
+    /// List ongoing partition reassignments (controller). A ZooKeeper-mode
+    /// broker that is not the controller answers `NOT_CONTROLLER`; a KRaft
+    /// broker would forward, but the controller is asked directly either way.
     ///
     /// # Errors
     ///
@@ -432,7 +434,7 @@ impl AdminClient {
         });
         let topics = &topics;
         let call_ref = &call;
-        call.single(Target::AnyBroker, |conn| async move {
+        call.single(Target::Controller, |conn| async move {
             let request = ListPartitionReassignmentsRequest {
                 timeout_ms: call_ref.remaining_ms(),
                 topics: topics.clone(),

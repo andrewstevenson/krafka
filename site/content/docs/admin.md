@@ -92,12 +92,12 @@ Each request goes to the node that can answer it:
 
 | Target | Operations |
 |---|---|
-| Controller | create/delete topics, create partitions, ACL create/delete, incremental alter configs (non-broker resources), client quota alter, SCRAM alter, delegation token create, elect leaders, alter reassignments, update features |
+| Controller | create/delete topics, create partitions, ACL create/delete, incremental alter configs (non-broker resources), client quota alter, SCRAM alter, delegation token create, elect leaders, alter and list reassignments, update features |
 | Group coordinator | describe/delete consumer groups, list/alter/delete group offsets, share-group offsets, Streams groups |
 | Transaction coordinator | describe transactions |
 | Partition leader | list offsets, delete records, offset for leader epoch, describe producers, the markers of `abort_transaction` |
 | A named broker | broker and broker-logger configs, log directories, `list_consumer_groups` and `list_transactions` (every broker), replica log-dir moves |
-| Any broker | describe cluster/ACLs/quotas/features/quorum/topics, other configs, token renew/expire/describe, list reassignments, FindCoordinator |
+| Any broker | describe cluster/ACLs/quotas/features/quorum/topics, other configs, token renew/expire/describe, FindCoordinator |
 
 Keys bound for the same node go in one request; requests to different nodes
 run concurrently.

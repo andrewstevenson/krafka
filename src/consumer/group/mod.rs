@@ -555,7 +555,7 @@ impl GroupCoordinator {
             ));
         }
 
-        let coordinator_addr = format!("{}:{}", find_response.host, find_response.port);
+        let coordinator_addr = crate::util::broker_address(&find_response.host, find_response.port);
         let old_coordinator_id = self.coordinator_id.lock().replace(find_response.node_id);
         *self.coordinator_addr.write() = Some(coordinator_addr.clone());
 

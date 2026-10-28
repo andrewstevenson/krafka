@@ -1556,7 +1556,10 @@ impl TransactionalProducer {
                     self.find_group_coordinator(group_id, attempt).await?;
                 let group_conn = self
                     .pool()
-                    .get_connection_by_id(group_node_id, &format!("{group_host}:{group_port}"))
+                    .get_connection_by_id(
+                        group_node_id,
+                        &crate::util::broker_address(&group_host, group_port),
+                    )
                     .await?;
                 let version = group_conn
                     .negotiate_api_version(

@@ -1106,6 +1106,18 @@ mod tests {
     }
 }
 
+/// A broker's `host:port` as a connectable address: an IPv6 literal host
+/// is bracketed (`[::1]:9092`), as brokers advertise it bare. Without the
+/// brackets `::1:9092` reads as one IPv6 address whenever the port is
+/// also a valid group, which Kafka's usual ports are.
+pub(crate) fn broker_address(host: &str, port: i32) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Parse a comma-separated bootstrap servers string into individual addresses.
 ///
 /// Trims whitespace, filters empty entries, and returns an error if no
@@ -1198,6 +1210,25 @@ pub fn extract_sni_hostname(address: &str) -> Result<&str> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod bootstrap_tests {
     use super::*;
+
+    #[test]
+    fn broker_address_brackets_ipv6_literals_only() {
+        assert_eq!(broker_address("::1", 9092), "[::1]:9092");
+        assert_eq!(broker_address("2001:db8::7", 9093), "[2001:db8::7]:9093");
+        assert_eq!(broker_address("[::1]", 9092), "[::1]:9092");
+        assert_eq!(broker_address("10.0.0.1", 9092), "10.0.0.1:9092");
+        assert_eq!(
+            broker_address("broker-1.example", 9092),
+            "broker-1.example:9092"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_broker_address_names_its_host_for_tls() {
+        let broker = crate::metadata::BrokerInfo::new(0, "::1".to_string(), 9092, None);
+        assert_eq!(broker.address(), "[::1]:9092");
+        assert_eq!(extract_sni_hostname(broker.address()).unwrap(), "::1");
+    }
 
     #[test]
     fn test_parse_bootstrap_servers_basic() {
