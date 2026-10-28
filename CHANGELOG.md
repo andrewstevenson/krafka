@@ -15,6 +15,8 @@ not a complete record.
 
 ### Fixed
 
+- The `zstd` feature requires `zstd` 0.14.3, which fixes RUSTSEC-2026-0391,
+  RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410.
 - A broker or coordinator advertised as an IPv6 literal is reached at
   `[host]:port`. Built as `host:port`, `::1:9092` read as one IPv6
   address whenever the port is also a valid group (Kafka's usual ports
