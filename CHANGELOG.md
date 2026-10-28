@@ -13,6 +13,11 @@ not a complete record.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `zstd` feature requires `zstd` 0.14.3, which fixes RUSTSEC-2026-0391,
+  RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410.
+
 ## [0.28.0] — 2026-10-23
 
 ### Added
